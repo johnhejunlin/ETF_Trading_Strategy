@@ -1,2 +1,2 @@
-# ETF_trad_strategy
-this is a ETF trad strategy
+# ETF_Trading_Strategy
+this is a ETF trading strategy
