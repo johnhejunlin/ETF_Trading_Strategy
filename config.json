@@ -1,0 +1,60 @@
+{
+  "symbols": ["588330"],
+  "timezone": "Asia/Shanghai",
+  "trading_sessions": [
+    ["09:15", "11:30"],
+    ["13:00", "15:15"]
+  ],
+  "dry_run": true,
+  "poll_seconds": 5,
+  "portfolio": {
+    "initial_cash": 50000
+  },
+  "risk": {
+    "max_orders_per_day": 1,
+    "require_manual_confirm": true,
+    "allowed_symbols": ["588330"]
+  },
+  "execution": {
+    "mode": "dry_run",
+    "stage": "dry_run",
+    "max_live_cash": 50000,
+    "small_live_cash": 5000,
+    "stage_cash_limits": {
+      "dry_run": 50000,
+      "gui_simulation": 50000,
+      "small_live": 5000,
+      "full_live": 50000
+    },
+    "require_screenshot_verification": true,
+    "final_confirm_enabled": false,
+    "price_tolerance": 0.001,
+    "verification_fields_path": ""
+  },
+  "notification": {
+    "channel": "wechat_client",
+    "wechat_recipient": ""
+  },
+  "runtime": {
+    "trade_day_schedule_enabled": true,
+    "stop_file": "STOP_TRADING",
+    "state_file": "runtime_state.json"
+  },
+  "backtest": {
+    "commission_rate": 0.0003,
+    "min_commission": 5,
+    "stamp_tax_rate": 0,
+    "slippage_bps": 2,
+    "limit_threshold_pct": 0.195
+  },
+  "strategy": {
+    "type": "trend_pullback",
+    "rising_days": 3,
+    "buy_cash_ratios": [0.5, 0.7, 1.0],
+    "max_position_ratio": 1.0,
+    "sell_holding_ratio": 0.5,
+    "profit_drawdown_ratio": 0.2,
+    "clear_position_on_sell_count": 3,
+    "lot_size": 100
+  }
+}

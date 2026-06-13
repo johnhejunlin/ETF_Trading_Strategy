@@ -1,0 +1,27 @@
+# macOS
+.DS_Store
+
+# Cache
+.cache/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# Database
+market_data.sqlite3
+
+# Logs
+trade_bot.log
+*.log
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Virtual env
+venv/
+.venv/

@@ -1,0 +1,14 @@
+{
+  "cash": 50000.0,
+  "positions": {
+    "588330": {
+      "quantity": 0,
+      "avg_cost": 0.0,
+      "max_profit_pct": 0.0,
+      "sell_streak": 0,
+      "buy_count": 0,
+      "buy_prices": [],
+      "last_trade_date": null
+    }
+  }
+}
