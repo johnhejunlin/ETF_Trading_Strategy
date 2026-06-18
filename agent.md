@@ -13,12 +13,14 @@
 
 - `README.md`：项目说明和常用命令。
 - `config.json`：策略、组合、交易时段和回测参数配置。
+- `market_data.py`：实时行情和日 K 数据获取；交易入口应通过它监控目标标的。
 - `trading_strategy.py`：交易信号和策略实现，不放回测报告、指标或撮合逻辑。
-- `trade_bot.py`：交易机器人主流程，当前默认 dry-run。
+- `trading_engine.py`：交易机器人主流程，当前默认 dry-run。
 - `backtest.py`：回测、回测数据处理、回测撮合、指标和报告生成脚本。
 - `portfolio.json`：本地模拟资金和持仓状态。
 - `signals.csv`：策略信号输出。
-- `trade_bot.log`：运行日志。
+- `trading_engine.log`：运行日志。
+- `trading_engine.monitor.log`：后台托管运行时的实时监控日志。
 - `runtime_state.json`：执行阶段和 GUI 模拟结果等运行状态记录。
 - `screenshots/`：同花顺截图、订单意图和 GUI 校验凭证。
 - `tests/`：不依赖网络和真实交易的安全单元测试。
@@ -66,20 +68,27 @@ Codex 可以帮助开发和维护这些层，但不应作为长期生产交易�
 ## 常用命令
 
 ```bash
-python3 trade_bot.py --once
-python3 trade_bot.py --once --ignore-hours
-python3 trade_bot.py --once --ignore-hours --ignore-trade-day
-python3 trade_bot.py --check-config
-python3 trade_bot.py
+python3 trading_engine.py --once
+python3 trading_engine.py --once --ignore-hours
+python3 trading_engine.py --once --ignore-hours --ignore-trade-day
+python3 trading_engine.py --check-config
+python3 trading_engine.py --status
+python3 trading_engine.py --stop
+python3 trading_engine.py --clear-stop
+python3 trading_engine.py --open-log
+python3 trading_engine.py
 python3 backtest.py --no-open
 python3 -m unittest discover -s tests
 ```
+
+后台托管运行使用 label `com.aistock.tradingengine`，不要再使用旧的 `com.aistock.tradebot`。
+持续运行时默认只在当前终端显示日志；如果需要额外实时日志窗口，用 `--open-log`。前台持续运行时可直接看终端日志并用 `Ctrl+C` 停止；后台/另一终端可用 `--stop` 写入 `STOP_TRADING` 让引擎尽快退出。
 
 修改策略后，至少运行一次回测或 dry-run 检查：
 
 ```bash
 python3 backtest.py
-python3 trade_bot.py --once --ignore-hours
+python3 trading_engine.py --once --ignore-hours
 ```
 
 策略修改后的回测报告应自动在 Microsoft Edge 中打开；只有用户明确要求只生成文件时才使用 `--no-open`。

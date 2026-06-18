@@ -27,22 +27,29 @@ class TrendPullbackStrategy:
         self.config = config
         self.market_data = market_data
         self.portfolio = portfolio
+        self.last_diagnostics: dict = {}
         self.rising_days = int(config["strategy"]["rising_days"])
-        self.buy_cash_ratios = [float(ratio) for ratio in config["strategy"]["buy_cash_ratios"]]
+        self.buy_position_targets = [
+            float(ratio) for ratio in config["strategy"].get("buy_position_targets", [0.5, 0.85, 1.0])
+        ]
         self.max_position_ratio = float(config["strategy"].get("max_position_ratio", 1.0))
         self.sell_holding_ratio = float(config["strategy"]["sell_holding_ratio"])
+        self.stop_loss_ratio = float(config["strategy"].get("stop_loss_ratio", 0.03))
         self.profit_drawdown_ratio = float(config["strategy"]["profit_drawdown_ratio"])
         self.sell_below_ma_window = int(config["strategy"].get("sell_below_ma_window", 0))
         self.clear_position_on_sell_count = int(config["strategy"]["clear_position_on_sell_count"])
         self.lot_size = int(config["strategy"]["lot_size"])
 
     def generate(self, symbol: str, today: str) -> Optional[OrderSignal]:
+        self.last_diagnostics = {}
         candles = self.market_data.daily_candles(symbol)
         current_price = candles[-1].close
         self.portfolio.update_max_profit(symbol, current_price)
 
         position = self.portfolio.position(symbol)
         quantity = int(position["quantity"])
+        latest_buy_price = self._latest_buy_price(position)
+        self.last_diagnostics = self._trend_diagnostics(candles, quantity, current_price, latest_buy_price)
         if quantity > 0:
             sell_signal = self._sell_signal(
                 symbol,
@@ -60,33 +67,36 @@ class TrendPullbackStrategy:
             logging.info("%s 今日已交易，跳过。", symbol)
             return None
 
-        buy_count = int(position.get("buy_count") or 0)
-        buy_prices = [float(price) for price in position.get("buy_prices", [])]
-        if buy_count < len(self.buy_cash_ratios) and self._buy_condition(candles, buy_count, buy_prices):
-            cash_ratio = self._buy_cash_ratio(buy_count)
+        buy_target = self._buy_target(candles, quantity, current_price, latest_buy_price)
+        if buy_target:
+            target_ratio, condition_note = buy_target
             equity = self.portfolio.cash() + quantity * current_price
-            position_room = max(0.0, equity * self.max_position_ratio - quantity * current_price)
-            cash_to_use = min(self.portfolio.cash() * cash_ratio, position_room)
-            buy_quantity = self._round_lot(cash_to_use / current_price)
+            buy_quantity = self._target_position_quantity(
+                cash=self.portfolio.cash(),
+                quantity=quantity,
+                price=current_price,
+                equity=equity,
+                target_ratio=target_ratio,
+            )
             if buy_quantity > 0:
-                condition_note = self._buy_condition_note(buy_count)
                 return OrderSignal(
                     symbol=symbol,
                     side="BUY",
                     quantity=buy_quantity,
                     limit_price=current_price,
-                    note=f"第{buy_count + 1}次买入，{condition_note}，使用可用资金{cash_ratio:.0%}",
+                    note=f"{condition_note}，买入至目标仓位{target_ratio:.0%}",
                 )
 
-        logging.info("%s 未满足买入/卖出条件。", symbol)
         return None
 
-    def _buy_condition(self, candles: list[Candle], buy_count: int, buy_prices: list[float]) -> bool:
-        if buy_count >= len(self.buy_cash_ratios):
-            return False
-
+    def _trend_diagnostics(
+        self,
+        candles: list[Candle],
+        quantity: int,
+        current_price: float,
+        latest_buy_price: Optional[float],
+    ) -> dict:
         closes = [c.close for c in candles]
-        current_price = closes[-1]
         first_buy_rising = self._rising_through_today(closes, previous_days=2)
         ma5 = self._ma(closes, 5)
         ma10 = self._ma(closes, 10)
@@ -94,22 +104,49 @@ class TrendPullbackStrategy:
         ma60 = self._ma(closes, 60)
         first_buy_ma = ma5 > ma10 > ma20
         add_buy_ma = first_buy_ma and ma20 > ma60
-        previous_buy_price = buy_prices[buy_count - 1] if buy_count > 0 and len(buy_prices) >= buy_count else None
-        price_above_previous_buy = previous_buy_price is not None and current_price > previous_buy_price
-        logging.info(
-            "趋势检查: buy_count=%s first_buy_rising=%s previous_buy_price=%s price_above_previous_buy=%s MA5=%.4f MA10=%.4f MA20=%.4f MA60=%.4f",
-            buy_count,
-            first_buy_rising,
-            f"{previous_buy_price:.4f}" if previous_buy_price is not None else "N/A",
-            price_above_previous_buy,
-            ma5,
-            ma10,
-            ma20,
-            ma60,
-        )
-        if buy_count == 0:
-            return first_buy_rising and first_buy_ma
-        return price_above_previous_buy and add_buy_ma
+        equity = self.portfolio.cash() + quantity * current_price
+        position_ratio = (quantity * current_price / equity) if equity > 0 else 0.0
+        price_above_latest_buy = latest_buy_price is not None and current_price > latest_buy_price
+        return {
+            "position_ratio": position_ratio,
+            "first_buy_rising": first_buy_rising,
+            "latest_buy_price": latest_buy_price,
+            "price_above_latest_buy": price_above_latest_buy,
+            "ma5": ma5,
+            "ma10": ma10,
+            "ma20": ma20,
+            "ma60": ma60,
+            "first_buy_ma": first_buy_ma,
+            "add_buy_ma": add_buy_ma,
+        }
+
+    def _buy_target(
+        self,
+        candles: list[Candle],
+        quantity: int,
+        current_price: float,
+        latest_buy_price: Optional[float],
+    ) -> Optional[tuple[float, str]]:
+        diagnostics = self.last_diagnostics or self._trend_diagnostics(candles, quantity, current_price, latest_buy_price)
+        first_buy_rising = bool(diagnostics["first_buy_rising"])
+        first_buy_ma = bool(diagnostics["first_buy_ma"])
+        add_buy_ma = bool(diagnostics["add_buy_ma"])
+        position_ratio = float(diagnostics["position_ratio"])
+        price_above_latest_buy = bool(diagnostics["price_above_latest_buy"])
+        first_target, second_target, final_target = self.buy_position_targets
+        if quantity == 0:
+            if first_buy_rising and first_buy_ma:
+                return first_target, "空仓，前两天上涨且当天上涨且 MA5>MA10>MA20"
+            return None
+        if position_ratio >= second_target:
+            if position_ratio < final_target and add_buy_ma and price_above_latest_buy:
+                return final_target, "仓位>=85%，当天价格大于最新买入价且 MA5>MA10>MA20>MA60"
+            return None
+        if position_ratio >= first_target:
+            if add_buy_ma and price_above_latest_buy:
+                return second_target, "仓位>=50%，当天价格大于最新买入价且 MA5>MA10>MA20>MA60"
+            return None
+        return None
 
     def _sell_signal(
         self,
@@ -125,6 +162,15 @@ class TrendPullbackStrategy:
             return None
 
         current_profit_pct = (current_price - avg_cost) / avg_cost
+        if current_profit_pct <= -self.stop_loss_ratio:
+            return OrderSignal(
+                symbol=symbol,
+                side="SELL",
+                quantity=quantity,
+                limit_price=current_price,
+                note=f"亏损达到{self.stop_loss_ratio:.0%}，清仓",
+            )
+
         if self.sell_below_ma_window:
             ma_stop = self._ma([c.close for c in candles], self.sell_below_ma_window)
             if current_price < ma_stop:
@@ -171,15 +217,36 @@ class TrendPullbackStrategy:
     def _round_lot(self, quantity: float) -> int:
         return int(math.floor(quantity / self.lot_size) * self.lot_size)
 
-    def _buy_cash_ratio(self, buy_count: int) -> float:
-        if buy_count < len(self.buy_cash_ratios):
-            return self.buy_cash_ratios[buy_count]
-        return self.buy_cash_ratios[-1]
+    def _ceil_lot(self, quantity: float) -> int:
+        return int(math.ceil(quantity / self.lot_size) * self.lot_size)
 
-    def _buy_condition_note(self, buy_count: int) -> str:
-        if buy_count == 0:
-            return "前两天上涨且当天上涨且 MA5>MA10>MA20"
-        return f"当天价格大于第{buy_count}次买入价格且 MA5>MA10>MA20>MA60"
+    def _target_position_quantity(
+        self,
+        *,
+        cash: float,
+        quantity: int,
+        price: float,
+        equity: float,
+        target_ratio: float,
+    ) -> int:
+        current_value = quantity * price
+        target_value = min(equity * target_ratio, equity * self.max_position_ratio)
+        value_to_buy = target_value - current_value
+        if value_to_buy <= 0 or cash <= 0 or price <= 0:
+            return 0
+        buy_quantity = self._ceil_lot(value_to_buy / price)
+        max_cash_quantity = self._round_lot(cash / price)
+        return min(buy_quantity, max_cash_quantity)
+
+    @staticmethod
+    def _latest_buy_price(position: dict) -> Optional[float]:
+        latest_buy_price = position.get("latest_buy_price")
+        if latest_buy_price is not None:
+            return float(latest_buy_price)
+        buy_prices = position.get("buy_prices") or []
+        if buy_prices:
+            return float(buy_prices[-1])
+        return None
 
     @staticmethod
     def _ma(values: list[float], window: int) -> float:

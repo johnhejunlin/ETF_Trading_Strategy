@@ -5,6 +5,7 @@ import argparse
 import html
 import json
 import math
+import re
 import sqlite3
 import subprocess
 import sys
@@ -29,6 +30,7 @@ MINUTE_DB_PATH = ROOT / "market_data.sqlite3"
 DEFAULT_BACKTEST_START = "2025-01-01"
 REPORT_PNG = ROOT / "backtest_588330.png"
 REPORT_HTML = ROOT / "backtest_588330.html"
+REPORT_CSV = ROOT / "backtest_trades_588330.csv"
 
 
 @dataclass
@@ -60,10 +62,11 @@ def load_config() -> dict:
 
 
 def set_report_paths(symbol: str, start: str, end: str) -> None:
-    global REPORT_PNG, REPORT_HTML
+    global REPORT_PNG, REPORT_HTML, REPORT_CSV
     label = f"{symbol}_{start.replace('-', '')}_{end.replace('-', '')}"
     REPORT_PNG = ROOT / f"backtest_{label}.png"
     REPORT_HTML = ROOT / f"backtest_{label}.html"
+    REPORT_CSV = ROOT / f"backtest_trades_{label}.csv"
 
 
 def fetch_tencent_daily(symbol: str, limit: int = 500) -> pd.DataFrame:
@@ -344,10 +347,12 @@ def run_backtest(
     sell_streak = 0
     buy_count = 0
     buy_prices: list[float] = []
+    latest_buy_price = None
     lot_size = int(strategy["lot_size"])
-    buy_cash_ratios = [float(ratio) for ratio in strategy["buy_cash_ratios"]]
+    buy_position_targets = [float(ratio) for ratio in strategy.get("buy_position_targets", [0.5, 0.85, 1.0])]
     max_position_ratio = float(strategy.get("max_position_ratio", 1.0))
     sell_holding_ratio = float(strategy["sell_holding_ratio"])
+    stop_loss_ratio = float(strategy.get("stop_loss_ratio", 0.03))
     profit_drawdown_ratio = float(strategy["profit_drawdown_ratio"])
     sell_below_ma_window = int(strategy.get("sell_below_ma_window", 0))
     clear_position_on_sell_count = int(strategy["clear_position_on_sell_count"])
@@ -382,7 +387,10 @@ def run_backtest(
             ma_stop_value = row.get(f"ma{sell_below_ma_window}") if sell_below_ma_window else None
             sell_quantity = 0
             sell_note = ""
-            if sell_below_ma_window and pd.notna(ma_stop_value) and price < float(ma_stop_value):
+            if current_profit_pct <= -stop_loss_ratio:
+                sell_quantity = position
+                sell_note = f"stop_loss={stop_loss_ratio:.0%}, clear_position"
+            elif sell_below_ma_window and pd.notna(ma_stop_value) and price < float(ma_stop_value):
                 sell_quantity = position
                 sell_note = f"close_below_MA{sell_below_ma_window}, clear_position"
             else:
@@ -437,16 +445,19 @@ def run_backtest(
                     sell_streak = 0
                     buy_count = 0
                     buy_prices = []
+                    latest_buy_price = None
                 else:
                     max_profit_pct = current_profit_pct
-        if not traded_today and buy_condition_for_count(row, buy_count, buy_prices, len(buy_cash_ratios)):
-            cash_ratio = buy_cash_ratio_for_count(buy_cash_ratios, buy_count)
+        buy_target = buy_target_for_position(row, cash, position, price, latest_buy_price, buy_position_targets)
+        if not traded_today and buy_target:
+            target_ratio, condition_note = buy_target
             equity_before_buy = cash + position * price
             current_position_value = position * price
-            position_room = max(0.0, equity_before_buy * max_position_ratio - current_position_value)
-            cash_to_use = min(cash * cash_ratio, position_room)
-            buy_quantity = affordable_lot_quantity(
-                cash_to_use,
+            buy_quantity = target_lot_quantity(
+                cash,
+                current_position_value,
+                equity_before_buy,
+                min(target_ratio, max_position_ratio),
                 execution_price_base.price,
                 slippage_rate,
                 lot_size,
@@ -468,7 +479,7 @@ def run_backtest(
                 sell_streak = 0
                 buy_count += 1
                 buy_prices.append(execution_price)
-                condition_note = buy_condition_note_for_count(buy_count)
+                latest_buy_price = execution_price
                 equity = cash + position * price
                 total_fees += fee
                 total_slippage_cost += slippage_cost
@@ -487,7 +498,7 @@ def run_backtest(
                         cash,
                         position,
                         equity,
-                        f"buy_count={buy_count}, cash_ratio={cash_ratio:.0%}, close={price:.4f}, "
+                        f"buy_count={buy_count}, target_position={target_ratio:.0%}, close={price:.4f}, "
                         f"execution_base={execution_price_base.price:.4f}"
                         f"({execution_price_base.source}{' ' + execution_price_base.timestamp if execution_price_base.timestamp else ''}), "
                         f"{condition_note}",
@@ -538,6 +549,7 @@ def run_backtest(
         "slippage_bps": slippage_rate * 10000,
         "limit_threshold_pct": limit_threshold_pct,
         "max_position_ratio": max_position_ratio,
+        "stop_loss_ratio": stop_loss_ratio,
         "sell_below_ma_window": sell_below_ma_window,
         "execution_price_mode": execution_price_mode,
         "execution_time": execution_time,
@@ -600,26 +612,33 @@ def max_drawdown_detail(bt: pd.DataFrame) -> dict:
     }
 
 
-def buy_cash_ratio_for_count(ratios: list[float], buy_count: int) -> float:
-    if buy_count < len(ratios):
-        return ratios[buy_count]
-    return ratios[-1]
+def buy_target_for_position(
+    row: pd.Series,
+    cash: float,
+    position: int,
+    price: float,
+    latest_buy_price: float | None,
+    targets: list[float],
+) -> tuple[float, str] | None:
+    first_target, second_target, final_target = targets
+    equity = cash + position * price
+    position_ratio = (position * price / equity) if equity > 0 else 0.0
+    if position == 0:
+        if bool(row["first_buy_condition"]):
+            return first_target, "empty position, previous 2 days rising plus today rising and MA5>MA10>MA20"
+        return None
 
-
-def buy_condition_for_count(row: pd.Series, buy_count: int, buy_prices: list[float], max_buy_count: int) -> bool:
-    if buy_count >= max_buy_count:
-        return False
-    if buy_count == 0:
-        return bool(row["first_buy_condition"])
-    if len(buy_prices) < buy_count:
-        return False
-    return bool(row["add_buy_ma_condition"]) and float(row["close"]) > buy_prices[buy_count - 1]
-
-
-def buy_condition_note_for_count(buy_count: int) -> str:
-    if buy_count == 1:
-        return "previous 2 days rising plus today rising and MA5>MA10>MA20"
-    return f"close above buy #{buy_count - 1} price and MA5>MA10>MA20>MA60"
+    price_above_latest_buy = latest_buy_price is not None and price > latest_buy_price
+    add_buy_condition = bool(row["add_buy_ma_condition"]) and price_above_latest_buy
+    if position_ratio >= second_target:
+        if position_ratio < final_target and add_buy_condition:
+            return final_target, "position>=85%, close above latest buy price and MA5>MA10>MA20>MA60"
+        return None
+    if position_ratio >= first_target:
+        if add_buy_condition:
+            return second_target, "position>=50%, close above latest buy price and MA5>MA10>MA20>MA60"
+        return None
+    return None
 
 
 def trade_fee(amount: float, commission_rate: float, min_commission: float, extra_rate: float) -> float:
@@ -639,6 +658,31 @@ def affordable_lot_quantity(
 ) -> int:
     execution_price = close_price * (1 + slippage_rate)
     quantity = int(math.floor((cash_available / execution_price) / lot_size) * lot_size)
+    while quantity > 0:
+        gross_amount = quantity * execution_price
+        fee = trade_fee(gross_amount, commission_rate, min_commission, 0.0)
+        if gross_amount + fee <= cash_available:
+            return quantity
+        quantity -= lot_size
+    return 0
+
+
+def target_lot_quantity(
+    cash_available: float,
+    current_position_value: float,
+    equity: float,
+    target_ratio: float,
+    close_price: float,
+    slippage_rate: float,
+    lot_size: int,
+    commission_rate: float,
+    min_commission: float,
+) -> int:
+    execution_price = close_price * (1 + slippage_rate)
+    value_to_buy = equity * target_ratio - current_position_value
+    if value_to_buy <= 0 or cash_available <= 0 or execution_price <= 0:
+        return 0
+    quantity = int(math.ceil((value_to_buy / execution_price) / lot_size) * lot_size)
     while quantity > 0:
         gross_amount = quantity * execution_price
         fee = trade_fee(gross_amount, commission_rate, min_commission, 0.0)
@@ -673,7 +717,7 @@ def plot_report(symbol: str, bt: pd.DataFrame, trades: list[Trade], stats: dict,
     plt.rcParams["font.sans-serif"] = ["Arial Unicode MS", "Heiti TC", "SimHei", "DejaVu Sans"]
     plt.rcParams["axes.unicode_minus"] = False
 
-    fig, (ax_price, ax_equity) = plt.subplots(
+    fig, (ax_price, ax_profit) = plt.subplots(
         2,
         1,
         figsize=(14, 9),
@@ -717,13 +761,20 @@ def plot_report(symbol: str, bt: pd.DataFrame, trades: list[Trade], stats: dict,
     ax_price.legend(loc="upper right", ncols=5, fontsize=9)
     ax_price.grid(True, alpha=0.25)
 
-    ax_equity.plot(bt["date"], bt["equity"], label="Equity", color="#7c3aed", linewidth=1.8)
-    ax_equity.axhline(stats["initial_cash"], color="#6b7280", linestyle="--", linewidth=1, label="Initial cash")
-    ax_equity.fill_between(bt["date"], stats["initial_cash"], bt["equity"], color="#7c3aed", alpha=0.12)
-    ax_equity.set_ylabel("Equity")
-    ax_equity.set_xlabel("Date")
-    ax_equity.legend(loc="upper left")
-    ax_equity.grid(True, alpha=0.25)
+    profit = bt["equity"] - stats["initial_cash"]
+    position_ratio = position_ratio_series(bt)
+    ax_profit.plot(bt["date"], profit, label="Profit", color="#2563eb", linewidth=1.8)
+    ax_profit.axhline(0, color="#6b7280", linestyle="--", linewidth=1, label="Zero profit")
+    ax_profit.fill_between(bt["date"], 0, profit, color="#2563eb", alpha=0.12)
+    ax_profit.set_ylabel("Profit")
+    ax_profit.set_xlabel("Date")
+    ax_profit.grid(True, alpha=0.25)
+    ax_position = ax_profit.twinx()
+    ax_position.plot(bt["date"], position_ratio, label="Position", color="#f59e0b", linestyle=":", linewidth=1.5)
+    ax_position.set_ylabel("Position")
+    lines, labels = ax_profit.get_legend_handles_labels()
+    pos_lines, pos_labels = ax_position.get_legend_handles_labels()
+    ax_profit.legend(lines + pos_lines, labels + pos_labels, loc="upper left")
 
     fig.autofmt_xdate()
     fig.tight_layout()
@@ -731,10 +782,42 @@ def plot_report(symbol: str, bt: pd.DataFrame, trades: list[Trade], stats: dict,
     plt.close(fig)
 
 
+def save_trades(trades: list[Trade]) -> None:
+    rows = [trade.__dict__ for trade in trades]
+    if rows:
+        df = pd.DataFrame(rows)
+        df["trade_date"] = df["trade_date"].dt.strftime("%Y-%m-%d")
+    else:
+        df = pd.DataFrame(
+            columns=[
+                "trade_date",
+                "side",
+                "price",
+                "quantity",
+                "gross_amount",
+                "fee",
+                "slippage_cost",
+                "realized_pnl",
+                "cash",
+                "position",
+                "equity",
+                "note",
+            ]
+        )
+    df.to_csv(REPORT_CSV, index=False, encoding="utf-8-sig")
+
+
 def save_html_report(symbol: str, bt: pd.DataFrame, trades: list[Trade], stats: dict, start: str, end: str) -> None:
     chart_bt = bt.copy()
     chart_bt["date_label"] = chart_bt["date"].dt.strftime("%Y-%m-%d")
-    equity_range = padded_range([float(value) for value in chart_bt["equity"]] + [float(stats["initial_cash"])])
+    chart_bt["profit"] = chart_bt["equity"] - float(stats["initial_cash"])
+    chart_bt["position_ratio"] = position_ratio_series(chart_bt)
+    profit_range = padded_range([float(value) for value in chart_bt["profit"]] + [0.0])
+    position_range = [0, max(1.0, float(chart_bt["position_ratio"].max()) * 1.12 if len(chart_bt) else 1.0)]
+    price_range = padded_range(
+        [float(value) for column in ["high", "low", "ma5", "ma10", "ma20", "ma60"] for value in chart_bt[column].dropna()]
+    )
+    marker_gap = (price_range[1] - price_range[0]) * 0.06 if len(price_range) == 2 else 0.03
     generated_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
     trade_rows = []
@@ -751,8 +834,14 @@ def save_html_report(symbol: str, bt: pd.DataFrame, trades: list[Trade], stats: 
             "cash": round(trade.cash, 2),
             "position": trade.position,
             "equity": round(trade.equity, 2),
-            "note": trade.note,
+            "note": compact_trade_note(trade),
         })
+    trade_rows_by_date: dict[str, list[dict]] = {}
+    for row in trade_rows:
+        trade_rows_by_date.setdefault(row["date"], []).append(row)
+
+    chart_data = build_chart_data(chart_bt, trade_rows_by_date)
+    chart_data_panel = render_chart_data_panel(chart_data[-1] if chart_data else {})
 
     fig = make_subplots(
         rows=2,
@@ -760,7 +849,8 @@ def save_html_report(symbol: str, bt: pd.DataFrame, trades: list[Trade], stats: 
         shared_xaxes=True,
         vertical_spacing=0.08,
         row_heights=[0.68, 0.32],
-        subplot_titles=("价格、均线与买卖点", "账户权益变化"),
+        specs=[[{}], [{"secondary_y": True}]],
+        subplot_titles=("价格、均线与买卖点", "利润与仓位"),
     )
     fig.add_trace(
         go.Candlestick(
@@ -798,7 +888,8 @@ def save_html_report(symbol: str, bt: pd.DataFrame, trades: list[Trade], stats: 
                 mode="lines",
                 name=name,
                 line={"color": color, "width": width},
-                hovertemplate="%{x}<br>" + name + ": %{y:.4f}<extra></extra>",
+                hoverinfo="skip",
+                hovertemplate=None,
             ),
             row=1,
             col=1,
@@ -806,22 +897,16 @@ def save_html_report(symbol: str, bt: pd.DataFrame, trades: list[Trade], stats: 
 
     for side, color, symbol_name in [("BUY", "#dc2626", "triangle-up"), ("SELL", "#16a34a", "triangle-down")]:
         side_trades = [trade for trade in trades if trade.side == side]
+        marker_prices = offset_trade_marker_prices(side_trades, chart_bt, side, marker_gap)
         fig.add_trace(
             go.Scatter(
                 x=[trade.trade_date.strftime("%Y-%m-%d") for trade in side_trades],
-                y=[trade.price for trade in side_trades],
-                mode="markers+text",
-                name="Buy" if side == "BUY" else "Sell",
-                marker={"symbol": symbol_name, "size": 13, "color": color, "line": {"color": "white", "width": 1}},
-                text=[f"{trade.quantity}@{trade.price:.3f}" for trade in side_trades],
-                textposition="top center" if side == "BUY" else "bottom center",
-                textfont={"size": 10, "color": color},
-                customdata=[[trade.quantity, trade.equity, trade.note] for trade in side_trades],
-                hovertemplate=(
-                    "%{x}<br>"
-                    + side
-                    + "<br>价格: %{y:.4f}<br>数量: %{customdata[0]:,}<br>权益: %{customdata[1]:,.2f}<br>%{customdata[2]}<extra></extra>"
-                ),
+                y=marker_prices,
+                mode="markers",
+                name="买入" if side == "BUY" else "卖出",
+                marker={"symbol": symbol_name, "size": 15, "color": color, "line": {"color": "white", "width": 1.4}},
+                hoverinfo="skip",
+                hovertemplate=None,
             ),
             row=1,
             col=1,
@@ -830,39 +915,59 @@ def save_html_report(symbol: str, bt: pd.DataFrame, trades: list[Trade], stats: 
     fig.add_trace(
         go.Scatter(
             x=chart_bt["date_label"],
-            y=chart_bt["equity"],
+            y=chart_bt["profit"],
             mode="lines",
-            name="Equity",
-            line={"color": "#7c3aed", "width": 2.4},
-            hovertemplate="%{x}<br>权益: %{y:,.2f}<extra></extra>",
+            name="利润",
+            line={"color": "#2563eb", "width": 2.4},
+            hovertemplate="%{x}<br>利润: %{y:,.2f}<extra></extra>",
         ),
         row=2,
         col=1,
+        secondary_y=False,
+    )
+    fig.add_trace(
+        go.Scatter(
+            x=chart_bt["date_label"],
+            y=chart_bt["position_ratio"],
+            mode="lines",
+            name="仓位",
+            line={"color": "#f59e0b", "width": 1.8, "dash": "dot"},
+            fill="tozeroy",
+            fillcolor="rgba(245, 158, 11, 0.12)",
+            hovertemplate="%{x}<br>仓位: %{y:.2%}<extra></extra>",
+        ),
+        row=2,
+        col=1,
+        secondary_y=True,
     )
     fig.add_hline(
-        y=stats["initial_cash"],
+        y=0,
         line_dash="dash",
         line_color="#667085",
-        annotation_text="Initial cash",
+        annotation_text="零利润",
         annotation_position="bottom right",
         row=2,
         col=1,
+        secondary_y=False,
     )
     if stats["drawdown_peak_date"] and stats["drawdown_trough_date"]:
+        peak_profit = float(stats["drawdown_peak_equity"] - stats["initial_cash"])
+        trough_profit = float(stats["drawdown_trough_equity"] - stats["initial_cash"])
         fig.add_trace(
             go.Scatter(
                 x=[stats["drawdown_peak_date"], stats["drawdown_trough_date"]],
-                y=[stats["drawdown_peak_equity"], stats["drawdown_trough_equity"]],
+                y=[peak_profit, trough_profit],
                 mode="lines+markers+text",
                 name="最大回撤",
                 line={"color": "#ef4444", "width": 2, "dash": "dash"},
                 marker={"size": 9, "color": ["#dc2626", "#16a34a"], "line": {"color": "white", "width": 1}},
                 text=["峰值", "谷底"],
                 textposition=["top center", "bottom center"],
-                hovertemplate="%{x}<br>权益: %{y:,.2f}<extra>最大回撤</extra>",
+                hovertemplate="%{x}<br>利润: %{y:,.2f}<extra>最大回撤</extra>",
             ),
             row=2,
             col=1,
+            secondary_y=False,
         )
     fig.update_layout(
         height=760,
@@ -872,11 +977,14 @@ def save_html_report(symbol: str, bt: pd.DataFrame, trades: list[Trade], stats: 
         template="plotly_white",
     )
     fig.update_yaxes(title_text="价格", row=1, col=1)
-    fig.update_yaxes(title_text="权益", range=equity_range, row=2, col=1)
+    fig.update_yaxes(title_text="利润", range=profit_range, row=2, col=1, secondary_y=False)
+    fig.update_yaxes(title_text="仓位", range=position_range, tickformat=".0%", row=2, col=1, secondary_y=True)
     fig.update_xaxes(type="category", rangeslider_visible=False)
     chart_html = fig.to_html(full_html=False, include_plotlyjs="cdn", config={"responsive": True, "displaylogo": False})
+    chart_script = render_chart_data_script(chart_data)
     metrics_html = render_metrics(stats, start, end)
     diagnostics_html = render_diagnostics(stats)
+    trade_summary = render_trade_summary(trade_rows)
     trade_table = render_trade_table(trade_rows)
 
     content = f"""<!doctype html>
@@ -983,6 +1091,74 @@ def save_html_report(symbol: str, bt: pd.DataFrame, trades: list[Trade], stats: 
     .buy {{ color: var(--buy); font-weight: 700; }}
     .sell {{ color: var(--sell); font-weight: 700; }}
     .hint {{ color: var(--muted); font-size: 13px; margin-top: 8px; }}
+    .chart-data {{
+      border-top: 1px solid #edf0f5;
+      border-radius: 8px;
+      margin-top: 8px;
+      padding-top: 12px;
+      background: transparent;
+    }}
+    .chart-data h2 {{
+      font-size: 16px;
+      margin: 0 0 10px;
+      color: var(--text);
+    }}
+    .chart-data-grid {{
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+      gap: 8px;
+    }}
+    .chart-data-item {{
+      border: 1px solid #edf0f5;
+      border-radius: 8px;
+      padding: 8px 10px;
+      background: #fbfcfe;
+      min-height: 58px;
+    }}
+    .chart-data-item span {{
+      display: block;
+      color: var(--muted);
+      font-size: 12px;
+      margin-bottom: 2px;
+    }}
+    .chart-data-item strong {{
+      display: block;
+      font-size: 14px;
+      line-height: 1.25;
+      overflow-wrap: anywhere;
+    }}
+    .trade-summary {{
+      border-top: 1px solid #edf0f5;
+      margin-top: 8px;
+      padding-top: 12px;
+    }}
+    .trade-summary h2 {{
+      font-size: 16px;
+      margin: 0 0 10px;
+    }}
+    .trade-list {{
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(230px, 1fr));
+      gap: 8px;
+      max-height: 220px;
+      overflow: auto;
+    }}
+    .trade-item {{
+      border: 1px solid #edf0f5;
+      border-radius: 8px;
+      padding: 8px 10px;
+      line-height: 1.45;
+      font-size: 13px;
+      background: #fbfcfe;
+    }}
+    .trade-item strong {{
+      display: block;
+      margin-bottom: 2px;
+      font-size: 13px;
+    }}
+    .trade-item span {{
+      color: var(--muted);
+    }}
     .diagnostics h2 {{
       font-size: 18px;
       margin: 0 0 10px;
@@ -999,6 +1175,7 @@ def save_html_report(symbol: str, bt: pd.DataFrame, trades: list[Trade], stats: 
       .metrics {{ grid-template-columns: repeat(2, minmax(0, 1fr)); }}
       .report-header {{ display: block; }}
       .generated-at {{ text-align: left; padding-top: 0; margin-top: 6px; white-space: normal; }}
+      .chart-data-grid {{ grid-template-columns: repeat(2, minmax(0, 1fr)); }}
       .table-panel {{ overflow-x: auto; }}
     }}
   </style>
@@ -1014,7 +1191,10 @@ def save_html_report(symbol: str, bt: pd.DataFrame, trades: list[Trade], stats: 
     </section>
     <section class="chart-panel">
       {chart_html}
-      <div class="hint">图表显示所有开市交易日，隐藏周末和节假日等非交易日；可缩放、拖拽、悬停查看明细。</div>
+      {chart_data_panel}
+      {chart_script}
+      {trade_summary}
+      <div class="hint">图表显示所有开市交易日，隐藏周末和节假日等非交易日；悬停时下方数据栏同步更新。</div>
     </section>
     <section class="diagnostics">
       <h2>回测质量检查</h2>
@@ -1135,6 +1315,192 @@ def render_diagnostics(stats: dict) -> str:
     return "<ul>" + "".join(f"<li>{html.escape(item)}</li>" for item in items) + "</ul>"
 
 
+def position_ratio_series(bt: pd.DataFrame) -> pd.Series:
+    equity = bt["equity"].replace(0, pd.NA)
+    ratio = (bt["position"] * bt["close"]) / equity
+    return ratio.fillna(0.0).clip(lower=0.0)
+
+
+def offset_trade_marker_prices(trades: list[Trade], chart_bt: pd.DataFrame, side: str, marker_gap: float) -> list[float]:
+    by_date = chart_bt.set_index("date_label")
+    prices = []
+    for trade in trades:
+        trade_date = trade.trade_date.strftime("%Y-%m-%d")
+        if trade_date in by_date.index:
+            row = by_date.loc[trade_date]
+            base = float(row["low"] if side == "BUY" else row["high"])
+            prices.append(base - marker_gap if side == "BUY" else base + marker_gap)
+        else:
+            prices.append(trade.price)
+    return prices
+
+
+def build_chart_data(chart_bt: pd.DataFrame, trades_by_date: dict[str, list[dict]]) -> list[dict]:
+    rows = []
+    for row in chart_bt.to_dict("records"):
+        date_label = row["date_label"]
+        rows.append(
+            {
+                "date": date_label,
+                "open": rounded_value(row.get("open")),
+                "high": rounded_value(row.get("high")),
+                "low": rounded_value(row.get("low")),
+                "close": rounded_value(row.get("close")),
+                "ma5": rounded_value(row.get("ma5")),
+                "ma10": rounded_value(row.get("ma10")),
+                "ma20": rounded_value(row.get("ma20")),
+                "ma60": rounded_value(row.get("ma60")),
+                "profit": rounded_value(row.get("profit"), 2),
+                "positionRatio": rounded_value(row.get("position_ratio"), 4),
+                "position": int(row.get("position") or 0),
+                "trades": trades_by_date.get(date_label, []),
+            }
+        )
+    return rows
+
+
+def rounded_value(value: object, digits: int = 4) -> float | None:
+    if value is None or pd.isna(value):
+        return None
+    return round(float(value), digits)
+
+
+def render_chart_data_panel(data: dict) -> str:
+    values = chart_data_display_values(data)
+    return f"""
+      <section class="chart-data" id="chart-data-panel">
+        <h2>图例数据</h2>
+        <div class="chart-data-grid">
+          <div class="chart-data-item"><span>日期</span><strong data-chart-field="date">{html.escape(values["date"])}</strong></div>
+          <div class="chart-data-item"><span>均线</span><strong data-chart-field="ma">{html.escape(values["ma"])}</strong></div>
+          <div class="chart-data-item"><span>买入</span><strong data-chart-field="buy">{html.escape(values["buy"])}</strong></div>
+          <div class="chart-data-item"><span>卖出</span><strong data-chart-field="sell">{html.escape(values["sell"])}</strong></div>
+          <div class="chart-data-item"><span>利润</span><strong data-chart-field="profit">{html.escape(values["profit"])}</strong></div>
+          <div class="chart-data-item"><span>仓位</span><strong data-chart-field="position">{html.escape(values["position"])}</strong></div>
+        </div>
+      </section>
+    """
+
+
+def chart_data_display_values(data: dict) -> dict[str, str]:
+    if not data:
+        return {"date": "-", "ma": "-", "buy": "-", "sell": "-", "profit": "-", "position": "-"}
+    trades = data.get("trades") or []
+    buy_text = "；".join(
+        f"{trade['quantity']:,}@{trade['price']:.3f}"
+        for trade in trades
+        if trade["side"] == "BUY"
+    ) or "-"
+    sell_text = "；".join(
+        f"{trade['quantity']:,}@{trade['price']:.3f}"
+        for trade in trades
+        if trade["side"] == "SELL"
+    ) or "-"
+    return {
+        "date": str(data.get("date") or "-"),
+        "ma": (
+            f"MA5 {format_optional(data.get('ma5'))} / MA10 {format_optional(data.get('ma10'))} / "
+            f"MA20 {format_optional(data.get('ma20'))} / MA60 {format_optional(data.get('ma60'))}"
+        ),
+        "buy": buy_text,
+        "sell": sell_text,
+        "profit": f"{float(data.get('profit') or 0):,.2f}",
+        "position": f"{float(data.get('positionRatio') or 0):.0%}（{int(data.get('position') or 0):,}股）",
+    }
+
+
+def format_optional(value: object) -> str:
+    if value is None or pd.isna(value):
+        return "-"
+    return f"{float(value):.4f}"
+
+
+def render_chart_data_script(chart_data: list[dict]) -> str:
+    payload = json.dumps(chart_data, ensure_ascii=False)
+    return f"""
+      <script>
+        (() => {{
+          const chartRows = {payload};
+          const chartMap = new Map(chartRows.map((row) => [row.date, row]));
+          const panel = document.getElementById("chart-data-panel");
+          const graph = document.querySelector(".chart-panel .plotly-graph-div");
+          if (!panel || !graph) return;
+          const setText = (field, value) => {{
+            const node = panel.querySelector(`[data-chart-field="${{field}}"]`);
+            if (node) node.textContent = value;
+          }};
+          const fmt = (value, digits = 4) => value === null || value === undefined || Number.isNaN(Number(value)) ? "-" : Number(value).toFixed(digits);
+          const render = (row) => {{
+            if (!row) return;
+            setText("date", row.date || "-");
+            setText("ma", `MA5 ${{fmt(row.ma5)}} / MA10 ${{fmt(row.ma10)}} / MA20 ${{fmt(row.ma20)}} / MA60 ${{fmt(row.ma60)}}`);
+            const buyText = (row.trades || []).filter((trade) => trade.side === "BUY").map((trade) => `${{Number(trade.quantity).toLocaleString("zh-CN")}}@${{Number(trade.price).toFixed(3)}}`).join("；") || "-";
+            const sellText = (row.trades || []).filter((trade) => trade.side === "SELL").map((trade) => `${{Number(trade.quantity).toLocaleString("zh-CN")}}@${{Number(trade.price).toFixed(3)}}`).join("；") || "-";
+            setText("buy", buyText);
+            setText("sell", sellText);
+            setText("profit", Number(row.profit || 0).toLocaleString("zh-CN", {{ minimumFractionDigits: 2, maximumFractionDigits: 2 }}));
+            setText("position", `${{Number(row.positionRatio || 0).toLocaleString("zh-CN", {{ style: "percent", maximumFractionDigits: 0 }})}}（${{Number(row.position || 0).toLocaleString("zh-CN")}}股）`);
+          }};
+          graph.on("plotly_hover", (event) => {{
+            const point = event.points && event.points[0];
+            const date = point && point.x;
+            render(chartMap.get(date));
+          }});
+          if (chartRows.length) render(chartRows[chartRows.length - 1]);
+        }})();
+      </script>
+    """
+
+
+def compact_trade_note(trade: Trade) -> str:
+    note = trade.note
+    source = "分时价" if "mootdx_1m" in note else "收盘价"
+    if trade.side == "BUY":
+        buy_match = re.search(r"buy_count=(\d+)", note)
+        target_match = re.search(r"target_position=([0-9.]+%)", note)
+        buy_count = buy_match.group(1) if buy_match else ""
+        target = target_match.group(1) if target_match else ""
+        prefix = f"第{buy_count}次买入" if buy_count else "买入"
+        return f"{prefix}，目标仓位{target}，{source}" if target else f"{prefix}，{source}"
+
+    if "close_below_MA" in note:
+        ma_match = re.search(r"close_below_MA(\d+)", note)
+        ma = ma_match.group(1) if ma_match else ""
+        return f"跌破MA{ma}，清仓，{source}" if ma else f"跌破均线，清仓，{source}"
+
+    sell_match = re.search(r"sell_count=(\d+)", note)
+    sell_count = sell_match.group(1) if sell_match else ""
+    if "clear_position" in note:
+        return f"第{sell_count}次回撤卖出，清仓，{source}" if sell_count else f"回撤卖出，清仓，{source}"
+    if "sell_half" in note:
+        return f"第{sell_count}次回撤卖出，减半，{source}" if sell_count else f"回撤卖出，减半，{source}"
+    return f"卖出，{source}"
+
+
+def render_trade_summary(trades: list[dict]) -> str:
+    if not trades:
+        return "<section class=\"trade-summary\"><h2>交易信息</h2><p class=\"hint\">暂无交易。</p></section>"
+
+    items = []
+    for trade in trades:
+        side_class = "buy" if trade["side"] == "BUY" else "sell"
+        side_label = "买入" if trade["side"] == "BUY" else "卖出"
+        items.append(
+            "<div class=\"trade-item\">"
+            f"<strong><span class=\"{side_class}\">{side_label}</span> {html.escape(trade['date'])} "
+            f"{trade['quantity']:,}@{trade['price']:.3f}</strong>"
+            f"<span>{html.escape(trade['note'])}</span>"
+            "</div>"
+        )
+    return (
+        "<section class=\"trade-summary\">"
+        "<h2>交易信息</h2>"
+        "<div class=\"trade-list\">"
+        + "".join(items)
+        + "</div></section>"
+    )
+
+
 def render_trade_table(trades: list[dict]) -> str:
     if not trades:
         return "<p class=\"hint\">暂无交易。</p>"
@@ -1142,10 +1508,11 @@ def render_trade_table(trades: list[dict]) -> str:
     rows = []
     for trade in trades:
         side_class = "buy" if trade["side"] == "BUY" else "sell"
+        side_label = "买入" if trade["side"] == "BUY" else "卖出"
         rows.append(
             "<tr>"
             f"<td>{html.escape(trade['date'])}</td>"
-            f"<td class=\"{side_class}\">{html.escape(trade['side'])}</td>"
+            f"<td class=\"{side_class}\">{side_label}</td>"
             f"<td>{trade['price']:.3f}</td>"
             f"<td>{trade['quantity']:,}</td>"
             f"<td>{trade['gross_amount']:,.2f}</td>"
@@ -1210,6 +1577,7 @@ def main() -> None:
         execution_time=args.execution_time,
     )
     set_report_paths(symbol, stats["actual_start"], stats["actual_end"])
+    save_trades(trades)
     save_html_report(symbol, bt, trades, stats, stats["actual_start"], stats["actual_end"])
     if args.png:
         plot_report(symbol, bt, trades, stats, stats["actual_start"], stats["actual_end"])
@@ -1220,6 +1588,7 @@ def main() -> None:
     print(f"html={REPORT_HTML}")
     if args.png:
         print(f"chart={REPORT_PNG}")
+    print(f"trades={REPORT_CSV}")
 
 
 if __name__ == "__main__":

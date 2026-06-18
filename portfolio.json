@@ -7,6 +7,7 @@
       "max_profit_pct": 0.0,
       "sell_streak": 0,
       "buy_count": 0,
+      "latest_buy_price": null,
       "buy_prices": [],
       "last_trade_date": null
     }

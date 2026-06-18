@@ -3,28 +3,30 @@ import argparse
 import csv
 import json
 import logging
-import socket
+import os
+import shlex
 import subprocess
 import time
-import urllib.parse
-import urllib.request
 from dataclasses import asdict, dataclass
 from datetime import datetime, time as dtime
 from pathlib import Path
 from typing import Optional
 from zoneinfo import ZoneInfo
 
-from trading_strategy import Candle, OrderSignal, TrendPullbackStrategy
+from market_data import EastMoneyMarketData
+from trading_strategy import OrderSignal, TrendPullbackStrategy
 
 
 ROOT = Path(__file__).resolve().parent
 CONFIG_PATH = ROOT / "config.json"
 PORTFOLIO_PATH = ROOT / "portfolio.json"
-LOG_PATH = ROOT / "trade_bot.log"
+LOG_PATH = ROOT / "trading_engine.log"
 STOP_PATH = ROOT / "STOP_TRADING"
 RUN_STATE_PATH = ROOT / "runtime_state.json"
 SIGNAL_AUDIT_PATH = ROOT / "signals.csv"
 SCREENSHOT_DIR = ROOT / "screenshots"
+STOP_POLL_SECONDS = 1
+LOG_SEPARATOR = "————————————————————————————————————————————————————"
 
 
 VALID_SIDES = {"BUY", "SELL"}
@@ -74,84 +76,6 @@ class TradingClock:
         return dtime(hour=int(hour), minute=int(minute))
 
 
-class EastMoneyMarketData:
-    def __init__(self, timeout_seconds: int = 10) -> None:
-        self.timeout_seconds = timeout_seconds
-
-    def daily_candles(self, symbol: str, limit: int = 120) -> list[Candle]:
-        try:
-            return self._eastmoney_daily_candles(symbol, limit)
-        except RuntimeError as exc:
-            logging.warning("%s 东方财富日 K 失败，切换腾讯备用源: %s", symbol, exc)
-            return self._tencent_daily_candles(symbol, limit)
-
-    def _eastmoney_daily_candles(self, symbol: str, limit: int) -> list[Candle]:
-        secid = self._secid(symbol)
-        params = {
-            "secid": secid,
-            "fields1": "f1,f2,f3,f4,f5,f6",
-            "fields2": "f51,f52,f53,f54,f55,f56,f57,f58,f59,f60,f61",
-            "klt": "101",
-            "fqt": "1",
-            "beg": "0",
-            "end": "20500101",
-            "lmt": str(limit),
-        }
-        url = "https://push2his.eastmoney.com/api/qt/stock/kline/get?" + urllib.parse.urlencode(params)
-        req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
-        payload = self._fetch_json(req)
-
-        klines = ((payload.get("data") or {}).get("klines") or [])
-        candles: list[Candle] = []
-        for item in klines:
-            parts = item.split(",")
-            if len(parts) < 3:
-                continue
-            candles.append(Candle(trade_date=parts[0], close=float(parts[2])))
-
-        if len(candles) < 60:
-            raise RuntimeError(f"{symbol} 日 K 数据不足，无法计算 60 日线。")
-        return candles
-
-    def _tencent_daily_candles(self, symbol: str, limit: int) -> list[Candle]:
-        market_symbol = self._tencent_symbol(symbol)
-        params = {"param": f"{market_symbol},day,,,{limit},qfq"}
-        url = "https://web.ifzq.gtimg.cn/appstock/app/fqkline/get?" + urllib.parse.urlencode(params)
-        req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
-        payload = self._fetch_json(req)
-        rows = (((payload.get("data") or {}).get(market_symbol) or {}).get("qfqday") or
-                ((payload.get("data") or {}).get(market_symbol) or {}).get("day") or [])
-
-        candles = [Candle(trade_date=row[0], close=float(row[2])) for row in rows if len(row) >= 3]
-        if len(candles) < 60:
-            raise RuntimeError(f"{symbol} 腾讯日 K 数据不足，无法计算 60 日线。")
-        return candles
-
-    def _fetch_json(self, req: urllib.request.Request) -> dict:
-        last_error: Optional[Exception] = None
-        for attempt in range(1, 4):
-            try:
-                with urllib.request.urlopen(req, timeout=self.timeout_seconds) as response:
-                    return json.loads(response.read().decode("utf-8"))
-            except (OSError, socket.timeout, json.JSONDecodeError) as exc:
-                last_error = exc
-                logging.warning("行情数据请求失败，第 %s 次重试: %s", attempt, exc)
-                time.sleep(attempt)
-        raise RuntimeError(f"行情数据请求连续失败: {last_error}")
-
-    @staticmethod
-    def _secid(symbol: str) -> str:
-        if symbol.startswith(("5", "6", "9")):
-            return f"1.{symbol}"
-        return f"0.{symbol}"
-
-    @staticmethod
-    def _tencent_symbol(symbol: str) -> str:
-        if symbol.startswith(("5", "6", "9")):
-            return f"sh{symbol}"
-        return f"sz{symbol}"
-
-
 class PortfolioStore:
     def __init__(self, path: Path, symbols: list[str], initial_cash: float) -> None:
         self.path = path
@@ -192,6 +116,7 @@ class PortfolioStore:
             position["max_profit_pct"] = 0.0
             position["sell_streak"] = 0
             position["buy_count"] = int(position.get("buy_count") or 0) + 1
+            position["latest_buy_price"] = fill_price
             position.setdefault("buy_prices", []).append(fill_price)
             return
 
@@ -216,6 +141,7 @@ class PortfolioStore:
             "max_profit_pct": 0.0,
             "sell_streak": 0,
             "buy_count": 0,
+            "latest_buy_price": None,
             "buy_prices": [],
             "last_trade_date": None,
         }
@@ -569,6 +495,193 @@ def audit_signal(signal: OrderSignal, result: Optional[ExecutionResult], decisio
         ])
 
 
+def format_trade_time(value: str) -> str:
+    if len(value) >= 14 and value[:14].isdigit():
+        return f"{value[:4]}-{value[4:6]}-{value[6:8]} {value[8:10]}:{value[10:12]}:{value[12:14]}"
+    return value or "N/A"
+
+
+def format_block_time(value: str) -> str:
+    return format_trade_time(value).replace(" ", "  ", 1)
+
+
+def format_change_percent(value: str) -> str:
+    if not value:
+        return "N/A"
+    return value if value.endswith("%") else f"{value}%"
+
+
+def format_relation(left: float, right: float) -> str:
+    if left > right:
+        return ">"
+    if left < right:
+        return "<"
+    return "="
+
+
+def format_money(value: float) -> str:
+    return f"{value:,.2f}".rstrip("0").rstrip(".")
+
+
+def signal_condition_text(signal: Optional[OrderSignal]) -> str:
+    if not signal:
+        return "未满足买入/卖出条件"
+    side = "买入" if signal.side == "BUY" else "卖出"
+    return f"满足{side}条件"
+
+
+def log_cycle_summary(symbol: str, quote, portfolio: PortfolioStore, diagnostics: dict, signal: Optional[OrderSignal]) -> None:
+    position = portfolio.position(symbol)
+    quantity = int(position.get("quantity") or 0)
+    holding_value = quantity * quote.price
+    cash = portfolio.cash()
+    equity = portfolio.cash() + holding_value
+    realtime_position_ratio = (holding_value / equity) if equity > 0 else 0.0
+    latest_buy_price = diagnostics.get("latest_buy_price")
+    ma5 = float(diagnostics.get("ma5") or 0.0)
+    ma10 = float(diagnostics.get("ma10") or 0.0)
+    ma20 = float(diagnostics.get("ma20") or 0.0)
+    ma60 = float(diagnostics.get("ma60") or 0.0)
+    latest_buy_price_text = f"{latest_buy_price:.4f}" if latest_buy_price is not None else "N/A"
+
+    logging.info(
+        "\n" + "\n".join([
+            LOG_SEPARATOR,
+            f"股票名称：{symbol}  {quote.name}",
+            f"行情时间：{format_block_time(quote.trade_time)}",
+            f"实时行情：最新价={quote.price:.4f}  涨幅={format_change_percent(quote.change_percent)}",
+            f"当前仓位：仓位={realtime_position_ratio:.2%}  持仓金额={format_money(holding_value)}  剩余金额={format_money(cash)}",
+            (
+                f"趋势检查：连续上涨={'是' if diagnostics.get('first_buy_rising') else '否'}  "
+                f"最新买价={latest_buy_price_text}  "
+                f"高于最新买价={'是' if diagnostics.get('price_above_latest_buy') else '否'}"
+            ),
+            (
+                "          "
+                f"均线=(MA5={ma5:.4f}) {format_relation(ma5, ma10)} "
+                f"(MA10={ma10:.4f}) {format_relation(ma10, ma20)} "
+                f"(MA20={ma20:.4f}) {format_relation(ma20, ma60)} "
+                f"(MA60={ma60:.4f})"
+            ),
+            f"交易条件：{signal_condition_text(signal)}",
+            LOG_SEPARATOR,
+        ])
+    )
+
+
+def stop_requested(path: Optional[Path] = None) -> bool:
+    path = path or STOP_PATH
+    return path.exists()
+
+
+def request_stop(reason: str = "user_requested", path: Optional[Path] = None) -> None:
+    path = path or STOP_PATH
+    payload = {
+        "requested_at": datetime.now().isoformat(timespec="seconds"),
+        "reason": reason,
+        "pid": os.getpid(),
+    }
+    with path.open("w", encoding="utf-8") as handle:
+        json.dump(payload, handle, ensure_ascii=False, indent=2)
+
+
+def clear_stop_request(path: Optional[Path] = None) -> bool:
+    path = path or STOP_PATH
+    if not path.exists():
+        return False
+    path.unlink()
+    return True
+
+
+def running_engine_processes() -> list[str]:
+    try:
+        result = subprocess.run(["ps", "ax", "-o", "pid=,command="], check=True, capture_output=True, text=True, timeout=5)
+    except (OSError, subprocess.SubprocessError):
+        return []
+
+    current_pid = str(os.getpid())
+    processes = []
+    for line in result.stdout.splitlines():
+        parts = line.strip().split(maxsplit=1)
+        if len(parts) != 2:
+            continue
+        pid, command = parts
+        if pid == current_pid:
+            continue
+        if "trading_engine.py" in command and "python" in command:
+            processes.append(f"{pid} {command}")
+    return processes
+
+
+def latest_log_lines(path: Path = LOG_PATH, limit: int = 8) -> list[str]:
+    if not path.exists():
+        return []
+    with path.open(encoding="utf-8", errors="replace") as handle:
+        return handle.readlines()[-limit:]
+
+
+def open_live_log_window(path: Path = LOG_PATH) -> bool:
+    path.touch(exist_ok=True)
+    messages = [
+        "AI Stock 交易引擎实时日志",
+        f"日志文件: {path}",
+        "关闭这个窗口只会停止查看日志，不会停止交易引擎。",
+        "停止交易引擎请运行: python3 trading_engine.py --stop",
+        "----------------------------------------",
+    ]
+    message_commands = [f"echo {shlex.quote(message)}" for message in messages]
+    command = "; ".join([
+        f"cd {shlex.quote(str(ROOT))}",
+        "printf '\\033]0;AI Stock 实时日志\\007'",
+        *message_commands,
+        f"tail -f {shlex.quote(str(path))}",
+    ])
+    script = f'''
+    tell application "Terminal"
+        activate
+        do script {json.dumps(command, ensure_ascii=False)}
+    end tell
+    '''
+    try:
+        subprocess.run(["osascript", "-e", script], check=True, capture_output=True, text=True, timeout=10)
+        logging.info("已自动打开实时日志窗口: %s", path)
+        return True
+    except (OSError, subprocess.SubprocessError) as exc:
+        logging.warning("自动打开实时日志窗口失败，请手动运行 tail -f %s。错误: %s", path, exc)
+        return False
+
+
+def print_status() -> None:
+    print(f"一键停止文件: {'已启用' if stop_requested() else '未启用'} ({STOP_PATH})")
+    processes = running_engine_processes()
+    if processes:
+        print("正在运行的交易引擎进程:")
+        for process in processes:
+            print(f"  {process}")
+    else:
+        print("正在运行的交易引擎进程: 未发现")
+    print(f"日志文件: {LOG_PATH}")
+    lines = latest_log_lines()
+    if lines:
+        print("最近日志:")
+        for line in lines:
+            print(f"  {line.rstrip()}")
+    print("常用控制命令:")
+    print("  前台可视运行: python3 trading_engine.py")
+    print("  停止引擎:     python3 trading_engine.py --stop")
+    print("  恢复允许运行: python3 trading_engine.py --clear-stop")
+
+
+def wait_for_next_poll(seconds: int) -> bool:
+    deadline = time.monotonic() + max(0, seconds)
+    while time.monotonic() < deadline:
+        if stop_requested():
+            logging.info("检测到停止文件，退出持续运行。")
+            return False
+        time.sleep(min(STOP_POLL_SECONDS, max(0, deadline - time.monotonic())))
+    return True
+
+
 def run_once(config: dict, ignore_hours: bool = False, ignore_trade_day: bool = False) -> None:
     clock = TradingClock(config["timezone"], config["trading_sessions"])
     notifier = Notifier(config)
@@ -588,13 +701,23 @@ def run_once(config: dict, ignore_hours: bool = False, ignore_trade_day: bool = 
 
     today = clock.today()
     portfolio = PortfolioStore(PORTFOLIO_PATH, config["symbols"], float(config["portfolio"]["initial_cash"]))
-    strategy = TrendPullbackStrategy(config, EastMoneyMarketData(), portfolio)
+    market_data = EastMoneyMarketData()
+    strategy = TrendPullbackStrategy(config, market_data, portfolio)
     executor = build_executor(config)
     runtime_state = RuntimeState(RUN_STATE_PATH)
 
     for symbol in config["symbols"]:
         if portfolio.traded_today(symbol, today):
             logging.info("%s 今日已执行过交易，跳过。", symbol)
+            continue
+
+        try:
+            quote = market_data.latest_quote(symbol)
+        except RuntimeError as exc:
+            message = f"{symbol} 实时行情获取失败: {exc}"
+            logging.error(message)
+            notifier.notify("AI Stock 行情异常", message)
+            portfolio.save()
             continue
 
         try:
@@ -605,6 +728,7 @@ def run_once(config: dict, ignore_hours: bool = False, ignore_trade_day: bool = 
             notifier.notify("AI Stock 策略异常", message)
             portfolio.save()
             continue
+        log_cycle_summary(symbol, quote, portfolio, strategy.last_diagnostics, signal)
         if not signal:
             portfolio.save()
             continue
@@ -662,18 +786,39 @@ def main() -> None:
     parser.add_argument("--ignore-hours", action="store_true", help="忽略交易时段限制，便于测试策略")
     parser.add_argument("--ignore-trade-day", action="store_true", help="忽略交易日限制，仅用于 dry-run/测试")
     parser.add_argument("--check-config", action="store_true", help="只检查配置并退出")
+    parser.add_argument("--status", action="store_true", help="查看运行状态、停止文件和最近日志")
+    parser.add_argument("--stop", action="store_true", help="写入 STOP_TRADING，让持续运行的交易引擎尽快退出")
+    parser.add_argument("--clear-stop", action="store_true", help="清除 STOP_TRADING，允许交易引擎再次运行")
+    parser.add_argument("--open-log", action="store_true", help="持续运行时额外打开实时日志窗口")
     args = parser.parse_args()
 
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s %(levelname)s %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
         handlers=[logging.FileHandler(LOG_PATH, encoding="utf-8"), logging.StreamHandler()],
     )
+
+    if args.stop:
+        request_stop()
+        logging.info("已写入停止文件: %s", STOP_PATH)
+        print(f"已请求停止交易引擎: {STOP_PATH}")
+        return
+
+    if args.clear_stop:
+        removed = clear_stop_request()
+        logging.info("%s停止文件: %s", "已清除" if removed else "未发现", STOP_PATH)
+        print(f"{'已清除' if removed else '未发现'}停止文件: {STOP_PATH}")
+        return
+
+    if args.status:
+        print_status()
+        return
 
     config = load_config()
     execution = config.get("execution", {})
     logging.info(
-        "启动交易机器人，股票代码: %s，mode=%s，stage=%s",
+        "启动交易机器人，股票代码: %s，执行模式=%s，执行阶段=%s",
         ",".join(config["symbols"]),
         execution.get("mode", "dry_run"),
         execution.get("stage", "dry_run"),
@@ -682,10 +827,10 @@ def main() -> None:
         clock = TradingClock(config["timezone"], config["trading_sessions"])
         RiskManager(config, clock)
         build_executor(config)
-        print("config ok")
+        print("配置检查通过")
         return
 
-    Notifier(config).notify("AI Stock 启动", f"mode={execution.get('mode', 'dry_run')} stage={execution.get('stage', 'dry_run')}")
+    Notifier(config).notify("AI Stock 启动", f"执行模式={execution.get('mode', 'dry_run')} 执行阶段={execution.get('stage', 'dry_run')}")
     if args.ignore_trade_day and execution.get("mode", "dry_run") != "dry_run":
         raise SystemExit("--ignore-trade-day 只允许搭配 execution.mode=dry_run 使用。")
 
@@ -693,9 +838,23 @@ def main() -> None:
         run_once(config, args.ignore_hours, args.ignore_trade_day)
         return
 
-    while True:
-        run_once(config, args.ignore_hours, args.ignore_trade_day)
-        time.sleep(int(config["poll_seconds"]))
+    poll_seconds = int(config["poll_seconds"])
+    logging.info("进入持续运行。前台可按 Ctrl+C 退出；也可运行 python3 trading_engine.py --stop。")
+    if args.open_log:
+        open_live_log_window()
+    try:
+        while True:
+            if stop_requested():
+                logging.info("检测到停止文件，退出持续运行。")
+                break
+            run_once(config, args.ignore_hours, args.ignore_trade_day)
+            if not wait_for_next_poll(poll_seconds):
+                break
+    except KeyboardInterrupt:
+        logging.info("收到 Ctrl+C，交易机器人已停止。")
+        print("\n已停止 trading_engine。")
+    finally:
+        logging.info("交易机器人退出。")
 
 
 if __name__ == "__main__":
