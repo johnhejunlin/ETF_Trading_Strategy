@@ -27,11 +27,22 @@ SIGNAL_AUDIT_PATH = ROOT / "signals.csv"
 SCREENSHOT_DIR = ROOT / "screenshots"
 STOP_POLL_SECONDS = 1
 LOG_SEPARATOR = "————————————————————————————————————————————————————"
+ANSI_RESET = "\033[0m"
+ANSI_BLACK = "\033[30m"
+ANSI_BOLD_BLUE = "\033[1;34m"
+ANSI_DARK_GRAY = "\033[90m"
+ANSI_BOLD_RED = "\033[1;31m"
+ANSI_BOLD_GREEN = "\033[1;32m"
+ANSI_BROWN = "\033[33m"
+ANSI_PURPLE = "\033[35m"
+ANSI_DARK_CYAN = "\033[36m"
+ANSI_PINK = "\033[95m"
 
 
 VALID_SIDES = {"BUY", "SELL"}
 EXECUTION_MODES = {"dry_run", "manual_confirm", "ths_computer_use"}
 EXECUTION_STAGES = {"dry_run", "gui_simulation", "small_live", "full_live"}
+THS_ACCOUNT_MODES = {"simulation", "live"}
 
 
 @dataclass(frozen=True)
@@ -278,6 +289,11 @@ class RiskManager:
             return RiskDecision(False, f"未知执行模式: {mode}")
         if not self._stage_allows_mode(stage, mode):
             return RiskDecision(False, f"执行阶段 {stage} 不允许模式 {mode}。")
+        ths_account_mode = str(self.execution.get("ths_account_mode", "simulation"))
+        if ths_account_mode not in THS_ACCOUNT_MODES:
+            return RiskDecision(False, f"未知同花顺账户模式: {ths_account_mode}")
+        if mode == "ths_computer_use" and ths_account_mode != "simulation" and not self.execution.get("live_account_enabled", False):
+            return RiskDecision(False, "同花顺 GUI 调试完成前必须使用模拟交易入口，实盘账户未启用。")
 
         if signal.side == "BUY":
             max_cash = self._stage_cash_limit(stage)
@@ -356,14 +372,19 @@ class ThsComputerUseExecutor(Executor):
         self.require_screenshot_verification = bool(self.execution.get("require_screenshot_verification", True))
         self.price_tolerance = float(self.execution.get("price_tolerance", 0.001))
         self.verification_fields_path = self.execution.get("verification_fields_path", "")
+        self.ths_account_mode = str(self.execution.get("ths_account_mode", "simulation"))
+        self.gui_bridge_command = str(self.execution.get("gui_bridge_command", "")).strip()
 
     def place_order(self, signal: OrderSignal) -> ExecutionResult:
         submitted_at = self._now()
         SCREENSHOT_DIR.mkdir(exist_ok=True)
         intent_path = self._write_intent(signal, submitted_at)
         self._activate_ths()
+        bridge_path = self._run_gui_bridge(intent_path)
         screenshot_path = self._capture_screenshot(signal, submitted_at)
         fields = self._read_verified_fields()
+        if bridge_path and not fields:
+            fields = self._read_verified_fields(bridge_path)
 
         if self.require_screenshot_verification:
             ok, message = self._verify_fields(signal, fields)
@@ -413,10 +434,41 @@ class ThsComputerUseExecutor(Executor):
             logging.info("已保存同花顺校验截图: %s", path)
             return path
         except Exception as exc:
+            logging.warning("Pillow 截图失败，尝试 macOS screencapture: %s", exc)
+        try:
+            subprocess.run(["/usr/sbin/screencapture", "-x", str(path)], check=True, capture_output=True, text=True, timeout=8)
+            logging.info("已保存同花顺校验截图: %s", path)
+            return path
+        except Exception as exc:
             if self.require_screenshot_verification:
                 raise RuntimeError(f"截图失败，禁止继续执行: {exc}") from exc
             logging.warning("截图失败，按配置允许继续: %s", exc)
             return None
+
+    def _run_gui_bridge(self, intent_path: Path) -> Optional[Path]:
+        if not self.gui_bridge_command:
+            return None
+        verification_path = self._verification_fields_path()
+        if verification_path is None:
+            verification_path = SCREENSHOT_DIR / "latest_verified_order.json"
+        verification_path.parent.mkdir(parents=True, exist_ok=True)
+        command = self.gui_bridge_command.format(
+            intent_path=shlex.quote(str(intent_path)),
+            verification_fields_path=shlex.quote(str(verification_path)),
+        )
+        try:
+            subprocess.run(
+                shlex.split(command),
+                check=True,
+                capture_output=True,
+                text=True,
+                timeout=30,
+                cwd=ROOT,
+            )
+            logging.info("同花顺 GUI bridge 已完成填单: %s", verification_path)
+            return verification_path
+        except (OSError, subprocess.SubprocessError) as exc:
+            raise RuntimeError(f"同花顺 GUI bridge 执行失败，禁止继续: {exc}") from exc
 
     def _write_intent(self, signal: OrderSignal, submitted_at: str) -> Path:
         SCREENSHOT_DIR.mkdir(exist_ok=True)
@@ -426,12 +478,18 @@ class ThsComputerUseExecutor(Executor):
             json.dump(payload, handle, ensure_ascii=False, indent=2)
         return path
 
-    def _read_verified_fields(self) -> dict:
+    def _verification_fields_path(self) -> Optional[Path]:
         if not self.verification_fields_path:
-            return {}
+            return None
         path = Path(self.verification_fields_path)
         if not path.is_absolute():
             path = ROOT / path
+        return path
+
+    def _read_verified_fields(self, override_path: Optional[Path] = None) -> dict:
+        path = override_path or self._verification_fields_path()
+        if path is None:
+            return {}
         if not path.exists():
             return {}
         with path.open(encoding="utf-8") as handle:
@@ -444,6 +502,9 @@ class ThsComputerUseExecutor(Executor):
             return False, f"代码不匹配: {fields.get('symbol')}"
         if str(fields.get("side", "")).upper() != signal.side:
             return False, f"方向不匹配: {fields.get('side')}"
+        account_mode = self._normalize_account_mode(fields.get("account_mode") or fields.get("trade_mode"))
+        if account_mode != self.ths_account_mode:
+            return False, f"同花顺账户模式不匹配: {fields.get('account_mode') or fields.get('trade_mode')}"
         try:
             quantity = int(fields.get("quantity"))
             price = float(fields.get("limit_price"))
@@ -455,6 +516,15 @@ class ThsComputerUseExecutor(Executor):
         if abs(price - expected_price) > self.price_tolerance:
             return False, f"价格不匹配: {price} != {expected_price}"
         return True, "校验通过。"
+
+    @staticmethod
+    def _normalize_account_mode(value: object) -> str:
+        text = str(value or "").strip().lower()
+        if text in {"simulation", "simulate", "mock", "paper", "模拟", "模拟交易", "模拟盘"}:
+            return "simulation"
+        if text in {"live", "real", "cash", "实盘", "真实", "真实交易", "普通交易"}:
+            return "live"
+        return text
 
 
 def build_executor(config: dict) -> Executor:
@@ -521,6 +591,69 @@ def format_relation(left: float, right: float) -> str:
 
 def format_money(value: float) -> str:
     return f"{value:,.2f}".rstrip("0").rstrip(".")
+
+
+def color_text(text: str, color: str) -> str:
+    return f"{color}{text}{ANSI_RESET}"
+
+
+def change_percent_is_down(line: str) -> bool:
+    marker = "涨幅="
+    if marker not in line:
+        return False
+    value = line.split(marker, 1)[1].strip()
+    return value.startswith("-")
+
+
+def color_log_line(line: str) -> str:
+    content = line.strip()
+    if content == LOG_SEPARATOR:
+        return color_text(line, ANSI_BLACK)
+    if content.startswith("股票名称："):
+        return color_text(line, ANSI_BOLD_BLUE)
+    if content.startswith("行情时间："):
+        return color_text(line, ANSI_DARK_GRAY)
+    if content.startswith("实时行情："):
+        return color_text(line, ANSI_BOLD_GREEN if change_percent_is_down(line) else ANSI_BOLD_RED)
+    if content.startswith("当前仓位："):
+        return color_text(line, ANSI_BROWN)
+    if content.startswith("趋势检查："):
+        return color_text(line, ANSI_PURPLE)
+    if content.startswith("均线="):
+        return color_text(line, ANSI_DARK_CYAN)
+    if content.startswith("交易条件："):
+        if "未满足" in content:
+            return color_text(line, ANSI_DARK_GRAY)
+        if "满足买入" in content:
+            return color_text(line, ANSI_BOLD_RED)
+        if "满足卖出" in content:
+            return color_text(line, ANSI_BOLD_GREEN)
+        return color_text(line, ANSI_DARK_GRAY)
+    if "风控" in content or "风险" in content:
+        return color_text(line, ANSI_PINK)
+    return line
+
+
+class TerminalColorFormatter(logging.Formatter):
+    def format(self, record: logging.LogRecord) -> str:
+        text = super().format(record)
+        return "\n".join(color_log_line(line) for line in text.splitlines())
+
+
+def setup_logging() -> None:
+    root_logger = logging.getLogger()
+    root_logger.setLevel(logging.INFO)
+    root_logger.handlers.clear()
+
+    file_formatter = logging.Formatter("%(asctime)s %(levelname)s %(message)s", datefmt="%Y-%m-%d %H:%M:%S")
+    file_handler = logging.FileHandler(LOG_PATH, encoding="utf-8")
+    file_handler.setFormatter(file_formatter)
+
+    stream_handler = logging.StreamHandler()
+    stream_handler.setFormatter(TerminalColorFormatter("%(asctime)s %(levelname)s %(message)s", datefmt="%Y-%m-%d %H:%M:%S"))
+
+    root_logger.addHandler(file_handler)
+    root_logger.addHandler(stream_handler)
 
 
 def signal_condition_text(signal: Optional[OrderSignal]) -> str:
@@ -792,12 +925,7 @@ def main() -> None:
     parser.add_argument("--open-log", action="store_true", help="持续运行时额外打开实时日志窗口")
     args = parser.parse_args()
 
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s %(levelname)s %(message)s",
-        datefmt="%Y-%m-%d %H:%M:%S",
-        handlers=[logging.FileHandler(LOG_PATH, encoding="utf-8"), logging.StreamHandler()],
-    )
+    setup_logging()
 
     if args.stop:
         request_stop()

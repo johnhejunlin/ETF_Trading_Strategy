@@ -18,6 +18,8 @@
   "execution": {
     "mode": "dry_run",
     "stage": "dry_run",
+    "ths_account_mode": "simulation",
+    "live_account_enabled": false,
     "max_live_cash": 50000,
     "small_live_cash": 5000,
     "stage_cash_limits": {
@@ -29,7 +31,8 @@
     "require_screenshot_verification": true,
     "final_confirm_enabled": false,
     "price_tolerance": 0.001,
-    "verification_fields_path": ""
+    "verification_fields_path": "screenshots/latest_verified_order.json",
+    "gui_bridge_command": "python3 ths_simulation_bridge.py --intent {intent_path} --verification {verification_fields_path}"
   },
   "notification": {
     "channel": "wechat_client",

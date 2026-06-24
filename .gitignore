@@ -16,6 +16,13 @@ market_data.sqlite3
 trade_bot.log
 *.log
 
+# Runtime state and GUI verification artifacts
+STOP_TRADING
+runtime_state.json
+screenshots/*.png
+screenshots/latest_order_intent.json
+screenshots/latest_verified_order.json
+
 # IDE
 .idea/
 .vscode/

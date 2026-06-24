@@ -43,7 +43,8 @@
 5. 如果未来接入券商 API，应优先使用官方、稳定、可审计接口。
 6. 下单逻辑必须能解释、能回放、能从日志复盘。
 7. `execution.mode=ths_computer_use` 仍必须通过截图/字段校验；不得为了“跑通”而绕过 `require_screenshot_verification`。
-8. `small_live` 之前必须先完成 dry-run 和 GUI 模拟阶段，不能直接把 `final_confirm_enabled` 打开。
+8. 同花顺 Mac 版在完全调试完成前必须使用 App 内“模拟”交易选项；保持 `execution.ths_account_mode=simulation` 和 `execution.live_account_enabled=false`。
+9. `small_live` 之前必须先完成 dry-run 和 GUI 模拟阶段，不能直接把 `final_confirm_enabled` 打开。
 
 ## 开发原则
 

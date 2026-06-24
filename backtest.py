@@ -30,7 +30,6 @@ MINUTE_DB_PATH = ROOT / "market_data.sqlite3"
 DEFAULT_BACKTEST_START = "2025-01-01"
 REPORT_PNG = ROOT / "backtest_588330.png"
 REPORT_HTML = ROOT / "backtest_588330.html"
-REPORT_CSV = ROOT / "backtest_trades_588330.csv"
 
 
 @dataclass
@@ -62,31 +61,62 @@ def load_config() -> dict:
 
 
 def set_report_paths(symbol: str, start: str, end: str) -> None:
-    global REPORT_PNG, REPORT_HTML, REPORT_CSV
+    global REPORT_PNG, REPORT_HTML
     label = f"{symbol}_{start.replace('-', '')}_{end.replace('-', '')}"
     REPORT_PNG = ROOT / f"backtest_{label}.png"
     REPORT_HTML = ROOT / f"backtest_{label}.html"
-    REPORT_CSV = ROOT / f"backtest_trades_{label}.csv"
 
 
-def fetch_tencent_daily(symbol: str, limit: int = 500) -> pd.DataFrame:
+def fetch_tencent_daily(
+    symbol: str,
+    start: str | None = None,
+    end: str | None = None,
+    *,
+    limit: int = 2000,
+    refresh_cache: bool = False,
+) -> pd.DataFrame:
+    requested_start = pd.to_datetime(start or DEFAULT_BACKTEST_START).normalize() - pd.Timedelta(days=120)
+    requested_end = pd.to_datetime(end or date.today().isoformat()).normalize() + pd.Timedelta(days=1)
+    init_daily_db(MINUTE_DB_PATH)
+    cached = read_daily_db(MINUTE_DB_PATH, symbol, requested_start, requested_end)
+    latest_cached_date = latest_daily_date(MINUTE_DB_PATH, symbol)
+    target_date = requested_end - pd.Timedelta(days=1)
+    if cached is not None and not refresh_cache and latest_cached_date is not None and latest_cached_date >= target_date:
+        annotate_daily_frame(cached)
+        return cached
+
     market_symbol = f"sh{symbol}" if symbol.startswith(("5", "6", "9")) else f"sz{symbol}"
     params = {"param": f"{market_symbol},day,,,{limit},qfq"}
     url = "https://web.ifzq.gtimg.cn/appstock/app/fqkline/get?" + urllib.parse.urlencode(params)
     req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
-    with urllib.request.urlopen(req, timeout=15) as response:
-        payload = json.loads(response.read().decode("utf-8"))
+    try:
+        with urllib.request.urlopen(req, timeout=15) as response:
+            payload = json.loads(response.read().decode("utf-8"))
+    except Exception:
+        if cached is not None:
+            annotate_daily_frame(cached)
+            return cached
+        raise
 
     node = (payload.get("data") or {}).get(market_symbol) or {}
     rows = node.get("qfqday") or node.get("day") or []
     if not rows:
+        if cached is not None:
+            annotate_daily_frame(cached)
+            return cached
         raise RuntimeError(f"未获取到 {symbol} 的日 K 数据。")
 
     df = pd.DataFrame(rows, columns=["date", "open", "close", "high", "low", "volume"])
     df["date"] = pd.to_datetime(df["date"])
     for column in ["open", "close", "high", "low", "volume"]:
         df[column] = pd.to_numeric(df[column], errors="coerce")
-    return df.dropna().sort_values("date").reset_index(drop=True)
+    df = df.dropna().sort_values("date").reset_index(drop=True)
+    upsert_daily_db(MINUTE_DB_PATH, symbol, df)
+    result = read_daily_db(MINUTE_DB_PATH, symbol, requested_start, requested_end)
+    if result is None or result.empty:
+        raise RuntimeError(f"数据库中没有 {symbol} 的日 K 数据。")
+    annotate_daily_frame(result)
+    return result
 
 
 def load_minute_prices(
@@ -187,6 +217,28 @@ def init_minute_db(db_path: Path) -> None:
         conn.execute("CREATE INDEX IF NOT EXISTS idx_minute_bars_lookup ON minute_bars(symbol, frequency, datetime)")
 
 
+def init_daily_db(db_path: Path) -> None:
+    with sqlite3.connect(db_path) as conn:
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS daily_bars (
+                symbol TEXT NOT NULL,
+                adjustment TEXT NOT NULL,
+                date TEXT NOT NULL,
+                open REAL NOT NULL,
+                close REAL NOT NULL,
+                high REAL NOT NULL,
+                low REAL NOT NULL,
+                volume REAL,
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                PRIMARY KEY (symbol, adjustment, date)
+            )
+            """
+        )
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_daily_bars_lookup ON daily_bars(symbol, adjustment, date)")
+
+
 def import_legacy_minute_cache(symbol: str, frequency: str) -> None:
     cache_path = CACHE_DIR / f"minute_{symbol}_1m.csv"
     if not cache_path.exists() or latest_minute_datetime(MINUTE_DB_PATH, symbol, frequency) is not None:
@@ -204,6 +256,17 @@ def latest_minute_datetime(db_path: Path, symbol: str, frequency: str) -> pd.Tim
         row = conn.execute(
             "SELECT MAX(datetime) FROM minute_bars WHERE symbol = ? AND frequency = ?",
             (symbol, frequency),
+        ).fetchone()
+    if not row or not row[0]:
+        return None
+    return pd.to_datetime(row[0])
+
+
+def latest_daily_date(db_path: Path, symbol: str, adjustment: str = "qfq") -> pd.Timestamp | None:
+    with sqlite3.connect(db_path) as conn:
+        row = conn.execute(
+            "SELECT MAX(date) FROM daily_bars WHERE symbol = ? AND adjustment = ?",
+            (symbol, adjustment),
         ).fetchone()
     if not row or not row[0]:
         return None
@@ -235,6 +298,33 @@ def read_minute_db(
         return None
     df["datetime"] = pd.to_datetime(df["datetime"], errors="coerce")
     return df.dropna(subset=["datetime", "close"]).reset_index(drop=True)
+
+
+def read_daily_db(
+    db_path: Path,
+    symbol: str,
+    start: pd.Timestamp,
+    end: pd.Timestamp,
+    adjustment: str = "qfq",
+) -> pd.DataFrame | None:
+    with sqlite3.connect(db_path) as conn:
+        df = pd.read_sql_query(
+            """
+            SELECT date, open, close, high, low, volume
+            FROM daily_bars
+            WHERE symbol = ?
+              AND adjustment = ?
+              AND date >= ?
+              AND date < ?
+            ORDER BY date
+            """,
+            conn,
+            params=(symbol, adjustment, start.strftime("%Y-%m-%d"), end.strftime("%Y-%m-%d")),
+        )
+    if df.empty:
+        return None
+    df["date"] = pd.to_datetime(df["date"], errors="coerce")
+    return df.dropna(subset=["date", "close"]).reset_index(drop=True)
 
 
 def upsert_minute_db(db_path: Path, symbol: str, frequency: str, minute: pd.DataFrame) -> None:
@@ -274,6 +364,41 @@ def upsert_minute_db(db_path: Path, symbol: str, frequency: str, minute: pd.Data
         )
 
 
+def upsert_daily_db(db_path: Path, symbol: str, daily: pd.DataFrame, adjustment: str = "qfq") -> None:
+    rows = []
+    for row in daily.to_dict("records"):
+        dt = pd.to_datetime(row["date"]).strftime("%Y-%m-%d")
+        rows.append(
+            (
+                symbol,
+                adjustment,
+                dt,
+                value_or_none(row.get("open")),
+                value_or_none(row.get("close")),
+                value_or_none(row.get("high")),
+                value_or_none(row.get("low")),
+                value_or_none(row.get("volume")),
+            )
+        )
+    if not rows:
+        return
+    with sqlite3.connect(db_path) as conn:
+        conn.executemany(
+            """
+            INSERT INTO daily_bars(symbol, adjustment, date, open, close, high, low, volume)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(symbol, adjustment, date) DO UPDATE SET
+                open = excluded.open,
+                close = excluded.close,
+                high = excluded.high,
+                low = excluded.low,
+                volume = excluded.volume,
+                updated_at = CURRENT_TIMESTAMP
+            """,
+            rows,
+        )
+
+
 def value_or_none(value: object) -> float | None:
     if value is None or pd.isna(value):
         return None
@@ -285,6 +410,13 @@ def annotate_minute_frame(minute: pd.DataFrame) -> None:
     minute.attrs["minute_rows"] = int(len(minute))
     minute.attrs["minute_start"] = minute["datetime"].min().strftime("%Y-%m-%d %H:%M") if not minute.empty else None
     minute.attrs["minute_end"] = minute["datetime"].max().strftime("%Y-%m-%d %H:%M") if not minute.empty else None
+
+
+def annotate_daily_frame(daily: pd.DataFrame) -> None:
+    daily.attrs["daily_db_path"] = str(MINUTE_DB_PATH)
+    daily.attrs["daily_rows"] = int(len(daily))
+    daily.attrs["daily_start"] = daily["date"].min().strftime("%Y-%m-%d") if not daily.empty else None
+    daily.attrs["daily_end"] = daily["date"].max().strftime("%Y-%m-%d") if not daily.empty else None
 
 
 def normalize_minute_frame(minute: pd.DataFrame) -> pd.DataFrame:
@@ -374,7 +506,10 @@ def run_backtest(
     equity_values = []
     cash_values = []
     position_values = []
+    avg_cost_values = []
+    current_build_profit_values = []
     execution_source_counts: dict[str, int] = {}
+    current_build_realized_pnl = 0.0
 
     for idx, row in bt.iterrows():
         price = float(row["close"])
@@ -413,6 +548,7 @@ def run_backtest(
                 realized_pnl = sell_quantity * (execution_price - avg_cost) - fee
                 cash += gross_amount - fee
                 position -= sell_quantity
+                current_build_realized_pnl += realized_pnl
                 sell_streak = next_sell_count
                 traded_today = True
                 equity = cash + position * price
@@ -446,6 +582,7 @@ def run_backtest(
                     buy_count = 0
                     buy_prices = []
                     latest_buy_price = None
+                    current_build_realized_pnl = 0.0
                 else:
                     max_profit_pct = current_profit_pct
         buy_target = buy_target_for_position(row, cash, position, price, latest_buy_price, buy_position_targets)
@@ -472,6 +609,8 @@ def run_backtest(
                 cost = gross_amount + fee
                 old_position = position
                 old_cost = old_position * avg_cost
+                if old_position == 0:
+                    current_build_realized_pnl = 0.0
                 cash -= cost
                 position += buy_quantity
                 avg_cost = (old_cost + cost) / position
@@ -508,10 +647,15 @@ def run_backtest(
         equity_values.append(cash + position * price)
         cash_values.append(cash)
         position_values.append(position)
+        avg_cost_values.append(avg_cost)
+        current_build_profit = current_build_realized_pnl + position * (price - avg_cost) if position > 0 else 0.0
+        current_build_profit_values.append(current_build_profit)
 
     bt["equity"] = equity_values
     bt["cash"] = cash_values
     bt["position"] = position_values
+    bt["avg_cost"] = avg_cost_values
+    bt["current_build_profit"] = current_build_profit_values
     final_equity = float(bt.iloc[-1]["equity"]) if len(bt) else initial_cash
     winning_trades = [pnl for pnl in realized_pnls if pnl > 0]
     losing_trades = [pnl for pnl in realized_pnls if pnl < 0]
@@ -554,6 +698,10 @@ def run_backtest(
         "execution_price_mode": execution_price_mode,
         "execution_time": execution_time,
         "execution_source_counts": execution_source_counts,
+        "daily_db_path": df.attrs.get("daily_db_path"),
+        "daily_rows": df.attrs.get("daily_rows", 0),
+        "daily_start": df.attrs.get("daily_start"),
+        "daily_end": df.attrs.get("daily_end"),
         "minute_db_path": minute_prices.attrs.get("minute_db_path") if minute_prices is not None else None,
         "minute_rows": minute_prices.attrs.get("minute_rows") if minute_prices is not None else 0,
         "minute_start": minute_prices.attrs.get("minute_start") if minute_prices is not None else None,
@@ -782,31 +930,6 @@ def plot_report(symbol: str, bt: pd.DataFrame, trades: list[Trade], stats: dict,
     plt.close(fig)
 
 
-def save_trades(trades: list[Trade]) -> None:
-    rows = [trade.__dict__ for trade in trades]
-    if rows:
-        df = pd.DataFrame(rows)
-        df["trade_date"] = df["trade_date"].dt.strftime("%Y-%m-%d")
-    else:
-        df = pd.DataFrame(
-            columns=[
-                "trade_date",
-                "side",
-                "price",
-                "quantity",
-                "gross_amount",
-                "fee",
-                "slippage_cost",
-                "realized_pnl",
-                "cash",
-                "position",
-                "equity",
-                "note",
-            ]
-        )
-    df.to_csv(REPORT_CSV, index=False, encoding="utf-8-sig")
-
-
 def save_html_report(symbol: str, bt: pd.DataFrame, trades: list[Trade], stats: dict, start: str, end: str) -> None:
     chart_bt = bt.copy()
     chart_bt["date_label"] = chart_bt["date"].dt.strftime("%Y-%m-%d")
@@ -850,7 +973,6 @@ def save_html_report(symbol: str, bt: pd.DataFrame, trades: list[Trade], stats: 
         vertical_spacing=0.08,
         row_heights=[0.68, 0.32],
         specs=[[{}], [{"secondary_y": True}]],
-        subplot_titles=("价格、均线与买卖点", "利润与仓位"),
     )
     fig.add_trace(
         go.Candlestick(
@@ -862,13 +984,22 @@ def save_html_report(symbol: str, bt: pd.DataFrame, trades: list[Trade], stats: 
             name="K线",
             increasing={"line": {"color": "#dc2626"}, "fillcolor": "#dc2626"},
             decreasing={"line": {"color": "#16a34a"}, "fillcolor": "#16a34a"},
-            hovertemplate=(
-                "%{x}<br>"
-                "开: %{open:.4f}<br>"
-                "高: %{high:.4f}<br>"
-                "低: %{low:.4f}<br>"
-                "收: %{close:.4f}<extra></extra>"
-            ),
+            hoverinfo="skip",
+            hovertemplate=None,
+        ),
+        row=1,
+        col=1,
+    )
+    fig.add_trace(
+        go.Scatter(
+            x=chart_bt["date_label"],
+            y=chart_bt["close"],
+            mode="lines",
+            name="光标定位",
+            line={"color": "rgba(0,0,0,0)", "width": 8},
+            opacity=0,
+            showlegend=False,
+            hovertemplate="%{x}<extra></extra>",
         ),
         row=1,
         col=1,
@@ -971,7 +1102,7 @@ def save_html_report(symbol: str, bt: pd.DataFrame, trades: list[Trade], stats: 
         )
     fig.update_layout(
         height=760,
-        margin={"l": 52, "r": 28, "t": 58, "b": 44},
+        margin={"l": 52, "r": 28, "t": 28, "b": 30},
         hovermode="x unified",
         legend={"orientation": "h", "yanchor": "bottom", "y": 1.02, "xanchor": "right", "x": 1},
         template="plotly_white",
@@ -980,11 +1111,12 @@ def save_html_report(symbol: str, bt: pd.DataFrame, trades: list[Trade], stats: 
     fig.update_yaxes(title_text="利润", range=profit_range, row=2, col=1, secondary_y=False)
     fig.update_yaxes(title_text="仓位", range=position_range, tickformat=".0%", row=2, col=1, secondary_y=True)
     fig.update_xaxes(type="category", rangeslider_visible=False)
+    fig.update_xaxes(showspikes=True, spikemode="across", spikesnap="cursor", spikecolor="#98a2b3", spikethickness=1)
+    fig.update_xaxes(showticklabels=False, title_text=None, row=2, col=1)
     chart_html = fig.to_html(full_html=False, include_plotlyjs="cdn", config={"responsive": True, "displaylogo": False})
     chart_script = render_chart_data_script(chart_data)
     metrics_html = render_metrics(stats, start, end)
     diagnostics_html = render_diagnostics(stats)
-    trade_summary = render_trade_summary(trade_rows)
     trade_table = render_trade_table(trade_rows)
 
     content = f"""<!doctype html>
@@ -1075,6 +1207,10 @@ def save_html_report(symbol: str, bt: pd.DataFrame, trades: list[Trade], stats: 
       padding: 14px;
       margin-top: 14px;
     }}
+    .chart-panel .plotly-graph-div:focus {{
+      outline: 2px solid #98a2b3;
+      outline-offset: 2px;
+    }}
     table {{
       width: 100%;
       border-collapse: collapse;
@@ -1092,10 +1228,10 @@ def save_html_report(symbol: str, bt: pd.DataFrame, trades: list[Trade], stats: 
     .sell {{ color: var(--sell); font-weight: 700; }}
     .hint {{ color: var(--muted); font-size: 13px; margin-top: 8px; }}
     .chart-data {{
-      border-top: 1px solid #edf0f5;
+      border-bottom: 1px solid #edf0f5;
       border-radius: 8px;
-      margin-top: 8px;
-      padding-top: 12px;
+      margin-bottom: 10px;
+      padding-bottom: 12px;
       background: transparent;
     }}
     .chart-data h2 {{
@@ -1105,7 +1241,7 @@ def save_html_report(symbol: str, bt: pd.DataFrame, trades: list[Trade], stats: 
     }}
     .chart-data-grid {{
       display: grid;
-      grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+      grid-template-columns: minmax(120px, 0.85fr) minmax(300px, 1.65fr) repeat(5, minmax(118px, 1fr));
       gap: 8px;
     }}
     .chart-data-item {{
@@ -1127,6 +1263,15 @@ def save_html_report(symbol: str, bt: pd.DataFrame, trades: list[Trade], stats: 
       line-height: 1.25;
       overflow-wrap: anywhere;
     }}
+    .chart-data-item.ma-item strong {{
+      white-space: nowrap;
+      overflow-wrap: normal;
+      word-break: keep-all;
+      font-size: clamp(13px, 1.05vw, 15px);
+    }}
+    .ma-gt {{ color: #dc2626; font-weight: 800; }}
+    .ma-lt {{ color: #16a34a; font-weight: 800; }}
+    .ma-eq {{ color: #172033; font-weight: 800; }}
     .trade-summary {{
       border-top: 1px solid #edf0f5;
       margin-top: 8px;
@@ -1176,6 +1321,8 @@ def save_html_report(symbol: str, bt: pd.DataFrame, trades: list[Trade], stats: 
       .report-header {{ display: block; }}
       .generated-at {{ text-align: left; padding-top: 0; margin-top: 6px; white-space: normal; }}
       .chart-data-grid {{ grid-template-columns: repeat(2, minmax(0, 1fr)); }}
+      .chart-data-item.ma-item {{ grid-column: 1 / -1; }}
+      .chart-data-item.ma-item strong {{ white-space: normal; }}
       .table-panel {{ overflow-x: auto; }}
     }}
   </style>
@@ -1190,11 +1337,10 @@ def save_html_report(symbol: str, bt: pd.DataFrame, trades: list[Trade], stats: 
       {metrics_html}
     </section>
     <section class="chart-panel">
-      {chart_html}
       {chart_data_panel}
+      {chart_html}
       {chart_script}
-      {trade_summary}
-      <div class="hint">图表显示所有开市交易日，隐藏周末和节假日等非交易日；悬停时下方数据栏同步更新。</div>
+      <div class="hint">图表显示所有开市交易日，隐藏周末和节假日等非交易日；悬停时上方数据栏同步更新。</div>
     </section>
     <section class="diagnostics">
       <h2>回测质量检查</h2>
@@ -1295,6 +1441,12 @@ def render_diagnostics(stats: dict) -> str:
     execution_counts = ", ".join(
         f"{source}: {count}" for source, count in sorted(stats.get("execution_source_counts", {}).items())
     ) or "无"
+    daily_db_note = (
+        f"日线数据库：{stats['daily_db_path']}，本次读取 {stats['daily_rows']:,} 根，"
+        f"覆盖 {stats['daily_start']} 至 {stats['daily_end']}。"
+        if stats.get("daily_db_path")
+        else "日线数据库：未启用。"
+    )
     minute_db_note = (
         f"分时数据库：{stats['minute_db_path']}，本次读取 {stats['minute_rows']:,} 根，"
         f"覆盖 {stats['minute_start']} 至 {stats['minute_end']}。"
@@ -1303,6 +1455,7 @@ def render_diagnostics(stats: dict) -> str:
     )
     items = [
         f"成交价：当前模式 {stats['execution_price_mode']}，目标成交时间 {stats['execution_time']}；实际交易成交价来源统计：{execution_counts}。",
+        daily_db_note,
         minute_db_note,
         f"手续费：佣金 {stats['commission_rate']:.4%}，最低 {stats['min_commission']:.2f} 元，印花税 {stats['stamp_tax_rate']:.4%}，已计入资金曲线。",
         f"滑点：每笔按 {stats['slippage_bps']:.2f} bps 估算，买入加价、卖出降价，已计入成交价和资金曲线。",
@@ -1351,6 +1504,7 @@ def build_chart_data(chart_bt: pd.DataFrame, trades_by_date: dict[str, list[dict
                 "ma20": rounded_value(row.get("ma20")),
                 "ma60": rounded_value(row.get("ma60")),
                 "profit": rounded_value(row.get("profit"), 2),
+                "currentBuildProfit": rounded_value(row.get("current_build_profit"), 2),
                 "positionRatio": rounded_value(row.get("position_ratio"), 4),
                 "position": int(row.get("position") or 0),
                 "trades": trades_by_date.get(date_label, []),
@@ -1372,10 +1526,11 @@ def render_chart_data_panel(data: dict) -> str:
         <h2>图例数据</h2>
         <div class="chart-data-grid">
           <div class="chart-data-item"><span>日期</span><strong data-chart-field="date">{html.escape(values["date"])}</strong></div>
-          <div class="chart-data-item"><span>均线</span><strong data-chart-field="ma">{html.escape(values["ma"])}</strong></div>
+          <div class="chart-data-item ma-item"><span>均线</span><strong data-chart-field="ma">{values["ma"]}</strong></div>
           <div class="chart-data-item"><span>买入</span><strong data-chart-field="buy">{html.escape(values["buy"])}</strong></div>
           <div class="chart-data-item"><span>卖出</span><strong data-chart-field="sell">{html.escape(values["sell"])}</strong></div>
           <div class="chart-data-item"><span>利润</span><strong data-chart-field="profit">{html.escape(values["profit"])}</strong></div>
+          <div class="chart-data-item"><span>建仓以来盈利</span><strong data-chart-field="currentBuildProfit">{html.escape(values["currentBuildProfit"])}</strong></div>
           <div class="chart-data-item"><span>仓位</span><strong data-chart-field="position">{html.escape(values["position"])}</strong></div>
         </div>
       </section>
@@ -1384,7 +1539,15 @@ def render_chart_data_panel(data: dict) -> str:
 
 def chart_data_display_values(data: dict) -> dict[str, str]:
     if not data:
-        return {"date": "-", "ma": "-", "buy": "-", "sell": "-", "profit": "-", "position": "-"}
+        return {
+            "date": "-",
+            "ma": "-",
+            "buy": "-",
+            "sell": "-",
+            "profit": "-",
+            "currentBuildProfit": "-",
+            "position": "-",
+        }
     trades = data.get("trades") or []
     buy_text = "；".join(
         f"{trade['quantity']:,}@{trade['price']:.3f}"
@@ -1398,15 +1561,36 @@ def chart_data_display_values(data: dict) -> dict[str, str]:
     ) or "-"
     return {
         "date": str(data.get("date") or "-"),
-        "ma": (
-            f"MA5 {format_optional(data.get('ma5'))} / MA10 {format_optional(data.get('ma10'))} / "
-            f"MA20 {format_optional(data.get('ma20'))} / MA60 {format_optional(data.get('ma60'))}"
-        ),
+        "ma": ma_comparison_html(data),
         "buy": buy_text,
         "sell": sell_text,
         "profit": f"{float(data.get('profit') or 0):,.2f}",
+        "currentBuildProfit": f"{float(data.get('currentBuildProfit') or 0):,.2f}",
         "position": f"{float(data.get('positionRatio') or 0):.0%}（{int(data.get('position') or 0):,}股）",
     }
+
+
+def ma_comparison_html(data: dict) -> str:
+    pairs = [("MA5", data.get("ma5")), ("MA10", data.get("ma10")), ("MA20", data.get("ma20")), ("MA60", data.get("ma60"))]
+    parts = []
+    for index, (label, value) in enumerate(pairs):
+        parts.append(label)
+        if index < len(pairs) - 1:
+            sign, css_class = compare_values(value, pairs[index + 1][1])
+            parts.append(f'<span class="{css_class}">{html.escape(sign)}</span>')
+    return " ".join(parts)
+
+
+def compare_values(left: object, right: object) -> tuple[str, str]:
+    if left is None or right is None or pd.isna(left) or pd.isna(right):
+        return "=", "ma-eq"
+    left_value = float(left)
+    right_value = float(right)
+    if left_value > right_value:
+        return ">", "ma-gt"
+    if left_value < right_value:
+        return "<", "ma-lt"
+    return "=", "ma-eq"
 
 
 def format_optional(value: object) -> str:
@@ -1425,28 +1609,65 @@ def render_chart_data_script(chart_data: list[dict]) -> str:
           const panel = document.getElementById("chart-data-panel");
           const graph = document.querySelector(".chart-panel .plotly-graph-div");
           if (!panel || !graph) return;
+          graph.tabIndex = 0;
+          graph.setAttribute("aria-label", "K线图，使用左右方向键移动光标");
+          let activeIndex = Math.max(chartRows.length - 1, 0);
           const setText = (field, value) => {{
             const node = panel.querySelector(`[data-chart-field="${{field}}"]`);
             if (node) node.textContent = value;
           }};
+          const setHtml = (field, value) => {{
+            const node = panel.querySelector(`[data-chart-field="${{field}}"]`);
+            if (node) node.innerHTML = value;
+          }};
           const fmt = (value, digits = 4) => value === null || value === undefined || Number.isNaN(Number(value)) ? "-" : Number(value).toFixed(digits);
+          const compare = (left, right) => {{
+            if (left === null || left === undefined || right === null || right === undefined || Number.isNaN(Number(left)) || Number.isNaN(Number(right))) {{
+              return `<span class="ma-eq">=</span>`;
+            }}
+            if (Number(left) > Number(right)) return `<span class="ma-gt">&gt;</span>`;
+            if (Number(left) < Number(right)) return `<span class="ma-lt">&lt;</span>`;
+            return `<span class="ma-eq">=</span>`;
+          }};
+          const maHtml = (row) => `MA5 ${{compare(row.ma5, row.ma10)}} MA10 ${{compare(row.ma10, row.ma20)}} MA20 ${{compare(row.ma20, row.ma60)}} MA60`;
           const render = (row) => {{
             if (!row) return;
             setText("date", row.date || "-");
-            setText("ma", `MA5 ${{fmt(row.ma5)}} / MA10 ${{fmt(row.ma10)}} / MA20 ${{fmt(row.ma20)}} / MA60 ${{fmt(row.ma60)}}`);
+            setHtml("ma", maHtml(row));
             const buyText = (row.trades || []).filter((trade) => trade.side === "BUY").map((trade) => `${{Number(trade.quantity).toLocaleString("zh-CN")}}@${{Number(trade.price).toFixed(3)}}`).join("；") || "-";
             const sellText = (row.trades || []).filter((trade) => trade.side === "SELL").map((trade) => `${{Number(trade.quantity).toLocaleString("zh-CN")}}@${{Number(trade.price).toFixed(3)}}`).join("；") || "-";
             setText("buy", buyText);
             setText("sell", sellText);
             setText("profit", Number(row.profit || 0).toLocaleString("zh-CN", {{ minimumFractionDigits: 2, maximumFractionDigits: 2 }}));
+            setText("currentBuildProfit", Number(row.currentBuildProfit || 0).toLocaleString("zh-CN", {{ minimumFractionDigits: 2, maximumFractionDigits: 2 }}));
             setText("position", `${{Number(row.positionRatio || 0).toLocaleString("zh-CN", {{ style: "percent", maximumFractionDigits: 0 }})}}（${{Number(row.position || 0).toLocaleString("zh-CN")}}股）`);
+          }};
+          const cursorTraceIndex = () => (graph.data || []).findIndex((trace) => trace.name === "光标定位");
+          const moveCursor = (index) => {{
+            if (!chartRows.length) return;
+            activeIndex = Math.max(0, Math.min(chartRows.length - 1, index));
+            render(chartRows[activeIndex]);
+            const curveNumber = cursorTraceIndex();
+            if (window.Plotly && curveNumber >= 0) {{
+              window.Plotly.Fx.hover(graph, [{{ curveNumber, pointNumber: activeIndex }}], ["xy"]);
+            }}
           }};
           graph.on("plotly_hover", (event) => {{
             const point = event.points && event.points[0];
             const date = point && point.x;
-            render(chartMap.get(date));
+            const row = chartMap.get(date);
+            if (!row) return;
+            const hoverIndex = chartRows.findIndex((item) => item.date === row.date);
+            if (hoverIndex >= 0) activeIndex = hoverIndex;
+            render(row);
           }});
-          if (chartRows.length) render(chartRows[chartRows.length - 1]);
+          graph.addEventListener("click", () => graph.focus());
+          graph.addEventListener("keydown", (event) => {{
+            if (event.key !== "ArrowLeft" && event.key !== "ArrowRight") return;
+            event.preventDefault();
+            moveCursor(activeIndex + (event.key === "ArrowRight" ? 1 : -1));
+          }});
+          if (chartRows.length) moveCursor(chartRows.length - 1);
         }})();
       </script>
     """
@@ -1475,30 +1696,6 @@ def compact_trade_note(trade: Trade) -> str:
     if "sell_half" in note:
         return f"第{sell_count}次回撤卖出，减半，{source}" if sell_count else f"回撤卖出，减半，{source}"
     return f"卖出，{source}"
-
-
-def render_trade_summary(trades: list[dict]) -> str:
-    if not trades:
-        return "<section class=\"trade-summary\"><h2>交易信息</h2><p class=\"hint\">暂无交易。</p></section>"
-
-    items = []
-    for trade in trades:
-        side_class = "buy" if trade["side"] == "BUY" else "sell"
-        side_label = "买入" if trade["side"] == "BUY" else "卖出"
-        items.append(
-            "<div class=\"trade-item\">"
-            f"<strong><span class=\"{side_class}\">{side_label}</span> {html.escape(trade['date'])} "
-            f"{trade['quantity']:,}@{trade['price']:.3f}</strong>"
-            f"<span>{html.escape(trade['note'])}</span>"
-            "</div>"
-        )
-    return (
-        "<section class=\"trade-summary\">"
-        "<h2>交易信息</h2>"
-        "<div class=\"trade-list\">"
-        + "".join(items)
-        + "</div></section>"
-    )
 
 
 def render_trade_table(trades: list[dict]) -> str:
@@ -1551,6 +1748,7 @@ def main() -> None:
     parser.add_argument("--end", default=date.today().isoformat())
     parser.add_argument("--execution-price", choices=["intraday", "close"], default="intraday", help="成交价来源：intraday 使用 1 分钟 K，close 使用日收盘价")
     parser.add_argument("--execution-time", default="15:00", help="intraday 模式下的目标成交时间，例如 09:31 或 15:00")
+    parser.add_argument("--refresh-daily-cache", action="store_true", help="重新从腾讯刷新日 K 并写入数据库")
     parser.add_argument("--refresh-minute-cache", action="store_true", help="忽略数据库最新时间，重新回补 mootdx 1 分钟 K")
     parser.add_argument("--png", action="store_true", help="额外生成 PNG 图片；默认只生成 HTML")
     parser.add_argument("--no-open", action="store_true", help="只生成报告，不自动打开浏览器")
@@ -1558,8 +1756,9 @@ def main() -> None:
 
     config = load_config()
     symbol = config["symbols"][0]
-    raw = fetch_tencent_daily(symbol)
+    raw = fetch_tencent_daily(symbol, args.start, args.end, refresh_cache=args.refresh_daily_cache)
     data = prepare_indicators(raw, int(config["strategy"]["rising_days"]))
+    data.attrs.update(raw.attrs)
     minute_prices = load_minute_prices(
         symbol,
         args.start,
@@ -1577,7 +1776,6 @@ def main() -> None:
         execution_time=args.execution_time,
     )
     set_report_paths(symbol, stats["actual_start"], stats["actual_end"])
-    save_trades(trades)
     save_html_report(symbol, bt, trades, stats, stats["actual_start"], stats["actual_end"])
     if args.png:
         plot_report(symbol, bt, trades, stats, stats["actual_start"], stats["actual_end"])
@@ -1588,7 +1786,6 @@ def main() -> None:
     print(f"html={REPORT_HTML}")
     if args.png:
         print(f"chart={REPORT_PNG}")
-    print(f"trades={REPORT_CSV}")
 
 
 if __name__ == "__main__":

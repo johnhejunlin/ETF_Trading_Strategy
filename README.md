@@ -161,10 +161,15 @@ launchctl remove com.aistock.tradingengine
 - `manual_confirm`：人工确认占位，当前不会提交真实订单。
 - `ths_computer_use`：同花顺 GUI 自动化安全框架，当前必须通过截图字段校验，真实提交仍被阻断，直到外部 Computer Use 适配器接入。
 
+同花顺 Mac 版交易界面必须先使用 App 内的“模拟”交易选项完成调试。`execution.ths_account_mode` 默认是 `simulation`，`execution.live_account_enabled=false`；在这个状态下，如果 GUI 校验识别到实盘/普通交易界面，系统会阻断执行。
+
+`execution.gui_bridge_command` 用于把 `trading_engine.py` 生成的订单字段传给同花顺模拟交易页。默认桥接脚本会读取 `screenshots/latest_order_intent.json` 中的 `symbol / side / quantity / limit_price`，在同花顺“模拟”页填入代码、买卖方向、数量和价格，并写回 `screenshots/latest_verified_order.json` 供执行器校验；它不会点击最终的“确定买入/卖出”。
+
 同花顺 GUI 校验字段可以通过 `execution.verification_fields_path` 指向一个 JSON 文件，格式示例：
 
 ```json
 {
+  "account_mode": "simulation",
   "symbol": "588330",
   "side": "BUY",
   "quantity": 100,
@@ -231,6 +236,9 @@ python3 backtest.py --png
 真实交易前请先长时间 dry-run 和 GUI 模拟。自动化交易可能因为行情延迟、网络、App 弹窗、坐标偏移等原因产生错误操作。当前代码不会绕过截图/字段校验直接点击真实最终确认。
 
 ## 更新记录
+
+- 更新日期：2026-06-24
+- 更新内容：补充同花顺 Mac 模拟交易桥接、安全账户模式校验、GUI 填单验证、行情数据节流与股票代码规范化，并更新自动化启动脚本。
 
 - 更新日期：2026-06-18
 - 更新内容：review README 并同步项目更新；交易入口调整为 `trading_engine.py`，补充实时行情层、持续运行/停止命令、项目结构、仓位目标买入、3% 止损、回测输出和测试说明。
