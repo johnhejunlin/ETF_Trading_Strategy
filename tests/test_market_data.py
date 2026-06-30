@@ -1,4 +1,7 @@
+import sqlite3
+import tempfile
 import unittest
+from pathlib import Path
 from unittest import mock
 
 import market_data
@@ -32,6 +35,41 @@ class MarketDataTests(unittest.TestCase):
         self.assertEqual(quote.previous_close, 1.28)
         self.assertEqual(quote.open_price, 1.281)
         self.assertEqual(quote.trade_time, "20260615103000")
+
+    def test_latest_quote_is_saved_to_sqlite(self) -> None:
+        raw = 'v_sh588330="1~科创综指ETF华夏~588330~1.290~1.280~1.281~1000~0~0~0~0~0~0~0~0~0~0~0~0~0~0~0~0~0~0~0~0~0~0~0~20260615103000~0";'
+        with tempfile.TemporaryDirectory() as tempdir:
+            db_path = Path(tempdir) / "market_data.sqlite3"
+            response = mock.MagicMock()
+            response.__enter__.return_value.read.return_value = raw.encode("gbk")
+            with mock.patch("market_data.urllib.request.urlopen", return_value=response):
+                quote = EastMoneyMarketData(db_path=db_path).latest_quote("588330")
+
+            with sqlite3.connect(db_path) as conn:
+                row = conn.execute(
+                    "SELECT symbol, name, price, previous_close, open_price, trade_time FROM realtime_quotes"
+                ).fetchone()
+
+        self.assertEqual(quote.price, 1.29)
+        self.assertEqual(row, ("588330", "科创综指ETF华夏", 1.29, 1.28, 1.281, "20260615103000"))
+
+    def test_daily_candles_are_saved_to_sqlite(self) -> None:
+        rows = []
+        for index in range(60):
+            day = index + 1
+            rows.append([f"2026-01-{day:02d}", "1.0", f"{1.0 + index / 1000:.3f}", "1.1", "0.9", "1000"])
+        payload = {"data": {"sh588330": {"qfqday": rows}}}
+        with tempfile.TemporaryDirectory() as tempdir:
+            db_path = Path(tempdir) / "market_data.sqlite3"
+            market = EastMoneyMarketData(db_path=db_path)
+            with mock.patch.object(market, "_fetch_json", return_value=payload):
+                candles = market._tencent_daily_candles("588330", 120)
+
+            with sqlite3.connect(db_path) as conn:
+                count = conn.execute("SELECT COUNT(*) FROM daily_bars WHERE symbol = ?", ("588330",)).fetchone()[0]
+
+        self.assertEqual(len(candles), 60)
+        self.assertEqual(count, 60)
 
     def test_eastmoney_wait_throttles_between_calls(self) -> None:
         original_last_call = market_data._eastmoney_last_call

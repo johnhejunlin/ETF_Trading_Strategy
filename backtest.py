@@ -22,11 +22,13 @@ import pandas as pd
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 
+from market_data_store import MARKET_DATA_DB_PATH, init_market_data_db
+
 
 ROOT = Path(__file__).resolve().parent
 CONFIG_PATH = ROOT / "config.json"
 CACHE_DIR = ROOT / ".cache"
-MINUTE_DB_PATH = ROOT / "market_data.sqlite3"
+MINUTE_DB_PATH = MARKET_DATA_DB_PATH
 DEFAULT_BACKTEST_START = "2025-01-01"
 REPORT_PNG = ROOT / "backtest_588330.png"
 REPORT_HTML = ROOT / "backtest_588330.html"
@@ -195,6 +197,7 @@ def load_minute_prices(
 
 
 def init_minute_db(db_path: Path) -> None:
+    init_market_data_db(db_path)
     with sqlite3.connect(db_path) as conn:
         conn.execute(
             """
@@ -218,6 +221,7 @@ def init_minute_db(db_path: Path) -> None:
 
 
 def init_daily_db(db_path: Path) -> None:
+    init_market_data_db(db_path)
     with sqlite3.connect(db_path) as conn:
         conn.execute(
             """

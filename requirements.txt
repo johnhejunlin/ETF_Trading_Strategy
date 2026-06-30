@@ -1,5 +1,7 @@
 pandas
+requests
 plotly
 matplotlib
 Pillow
 mootdx
+stockstats

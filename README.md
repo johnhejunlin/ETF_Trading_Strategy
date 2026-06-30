@@ -43,6 +43,7 @@
 - 行情层：
   - `market_data.py`：负责实时行情和日 K 数据
   - `trading_engine.py` 持续运行时会先记录目标标的实时行情，再调用策略判断
+  - 所有抓取到的行情数据统一保存到项目根目录的 `market_data.sqlite3`
 - 回测成本与诊断：
   - 佣金、最低手续费、印花税、滑点会计入资金曲线
   - 报告包含最大回撤、胜率、盈亏比、换手率、停牌/涨跌停检查、未来函数提示、幸存者偏差提示
@@ -119,11 +120,13 @@ python3 -m unittest discover -s tests
 
 - `trading_engine.py`：长期运行入口，负责调度、风控、执行、通知和日志。
 - `market_data.py`：行情数据层，负责实时行情和日 K。
+- `market_data_store.py`：行情 SQLite 落库层，统一维护 `market_data.sqlite3`。
 - `trading_strategy.py`：策略层，只负责生成交易信号。
 - `backtest.py`：回测层，只负责历史回测、回测撮合、指标和报告。
 - `config.json`：配置中心。
 - `portfolio.json`：本地模拟资金和持仓状态。
 - `signals.csv`：信号和执行审计。
+- `market_data.sqlite3`：行情数据库，保存回测日 K、回测 1 分钟 K 和实时轮询行情。
 - `trading_engine.log`：交易引擎运行日志。
 - `trading_engine.monitor.log`：后台托管运行时建议使用的监控日志。
 - `tests/`：安全测试和基础解析测试。
@@ -131,7 +134,7 @@ python3 -m unittest discover -s tests
 后台运行建议：
 
 ```bash
-launchctl submit -l com.aistock.tradingengine -- /bin/zsh -lc 'cd /Users/yangdiandian/AI\ Stock && exec /usr/bin/python3 trading_engine.py >> trading_engine.monitor.log 2>&1'
+launchctl submit -l com.aistock.tradingengine -- /usr/bin/env zsh -lc 'cd "$1" && exec "$(command -v python3)" trading_engine.py >> trading_engine.monitor.log 2>&1' zsh "$(pwd)"
 ```
 
 查看后台日志：
@@ -221,6 +224,20 @@ python3 backtest.py --no-open --refresh-minute-cache
 python3 backtest.py --png
 ```
 
+## 行情数据保存
+
+项目根目录的 `market_data.sqlite3` 是统一行情数据库：
+
+- `daily_bars`：日 K 数据。回测抓取和实时策略检查抓取的日 K 都会写入这里。
+- `minute_bars`：1 分钟 K 数据。回测使用 `mootdx` 抓取的分时数据会写入这里。
+- `realtime_quotes`：实时轮询行情。`trading_engine.py` 每次获取目标标的实时行情后会追加一条记录。
+
+查看数据库表：
+
+```bash
+sqlite3 market_data.sqlite3 ".tables"
+```
+
 ## 数据源约定
 
 已安装 `a-stock-data` skill。后续 A 股行情、历史 K 线、交易日等数据获取，优先按照该 skill 的要求和数据源流程执行。
@@ -236,6 +253,9 @@ python3 backtest.py --png
 真实交易前请先长时间 dry-run 和 GUI 模拟。自动化交易可能因为行情延迟、网络、App 弹窗、坐标偏移等原因产生错误操作。当前代码不会绕过截图/字段校验直接点击真实最终确认。
 
 ## 更新记录
+
+- 更新日期：2026-06-30
+- 更新内容：准备上传 GitHub：确认默认仍为 `dry_run` 安全模式，保留运行日志、行情数据库和本地 GUI 校验产物在 `.gitignore` 中，避免提交本地运行状态。
 
 - 更新日期：2026-06-24
 - 更新内容：补充同花顺 Mac 模拟交易桥接、安全账户模式校验、GUI 填单验证、行情数据节流与股票代码规范化，并更新自动化启动脚本。

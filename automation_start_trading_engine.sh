@@ -1,14 +1,17 @@
-#!/bin/zsh
+#!/usr/bin/env zsh
 set -euo pipefail
 
-cd "/Users/yangdiandian/AI Stock"
+SCRIPT_DIR="$(cd -- "$(dirname -- "$0")" && pwd -P)"
+PYTHON_BIN="${PYTHON_BIN:-$(command -v python3)}"
 
-/usr/bin/python3 trading_engine.py --clear-stop
+cd "$SCRIPT_DIR"
 
-if /usr/bin/pgrep -fl 'python3.*trading_engine.py' >/dev/null 2>&1; then
+"$PYTHON_BIN" trading_engine.py --clear-stop
+
+if pgrep -fl 'python3.*trading_engine.py' >/dev/null 2>&1; then
   echo "$(date '+%Y-%m-%d %H:%M:%S') trading_engine.py already running; skip start."
   exit 0
 fi
 
 echo "$(date '+%Y-%m-%d %H:%M:%S') opening Trading_Engine.command."
-/usr/bin/open "/Users/yangdiandian/AI Stock/Trading_Engine.command"
+open "$SCRIPT_DIR/Trading_Engine.command"

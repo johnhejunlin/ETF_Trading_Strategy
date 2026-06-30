@@ -1,10 +1,13 @@
-#!/bin/zsh
-cd "/Users/yangdiandian/AI Stock" || exit 1
+#!/usr/bin/env zsh
+SCRIPT_DIR="$(cd -- "$(dirname -- "$0")" && pwd -P)"
+PYTHON_BIN="${PYTHON_BIN:-$(command -v python3)}"
+
+cd "$SCRIPT_DIR" || exit 1
 
 clear
 echo "AI Stock 交易引擎"
-echo "工作目录: /Users/yangdiandian/AI Stock"
-echo "启动命令: /usr/bin/python3 trading_engine.py"
+echo "工作目录: $SCRIPT_DIR"
+echo "启动命令: $PYTHON_BIN trading_engine.py"
 echo
 
 if [[ -f STOP_TRADING ]]; then
@@ -26,4 +29,4 @@ if [[ -n "$running_processes" ]]; then
   fi
 fi
 
-exec /usr/bin/python3 trading_engine.py
+exec "$PYTHON_BIN" trading_engine.py

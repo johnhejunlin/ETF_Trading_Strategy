@@ -7,8 +7,10 @@ import time
 import urllib.parse
 import urllib.request
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Optional
 
+from market_data_store import MARKET_DATA_DB_PATH, init_market_data_db, insert_realtime_quote, upsert_daily_bars
 from trading_strategy import Candle
 
 
@@ -30,8 +32,10 @@ class LatestQuote:
 
 
 class EastMoneyMarketData:
-    def __init__(self, timeout_seconds: int = 10) -> None:
+    def __init__(self, timeout_seconds: int = 10, db_path: Path = MARKET_DATA_DB_PATH) -> None:
         self.timeout_seconds = timeout_seconds
+        self.db_path = db_path
+        init_market_data_db(self.db_path)
 
     def daily_candles(self, symbol: str, limit: int = 120) -> list[Candle]:
         symbol = self._normalize_symbol(symbol)
@@ -51,7 +55,9 @@ class EastMoneyMarketData:
             try:
                 with urllib.request.urlopen(req, timeout=self.timeout_seconds) as response:
                     raw = response.read().decode("gbk", errors="ignore")
-                return self._parse_tencent_quote(symbol, raw)
+                quote = self._parse_tencent_quote(symbol, raw)
+                self._save_latest_quote(quote)
+                return quote
             except (OSError, socket.timeout, UnicodeDecodeError, ValueError) as exc:
                 last_error = exc
                 logging.warning("%s 实时行情请求失败，第 %s 次重试: %s", symbol, attempt, exc)
@@ -81,15 +87,28 @@ class EastMoneyMarketData:
         payload = self._fetch_eastmoney_json(req)
 
         klines = ((payload.get("data") or {}).get("klines") or [])
+        daily_rows = []
         candles: list[Candle] = []
         for item in klines:
             parts = item.split(",")
-            if len(parts) < 3:
+            if len(parts) < 6:
                 continue
+            daily_rows.append(
+                {
+                    "symbol": symbol,
+                    "date": parts[0],
+                    "open": parts[1],
+                    "close": parts[2],
+                    "high": parts[3],
+                    "low": parts[4],
+                    "volume": parts[5],
+                }
+            )
             candles.append(Candle(trade_date=parts[0], close=float(parts[2])))
 
         if len(candles) < 60:
             raise RuntimeError(f"{symbol} 日 K 数据不足，无法计算 60 日线。")
+        self._save_daily_rows(daily_rows)
         return candles
 
     def _tencent_daily_candles(self, symbol: str, limit: int) -> list[Candle]:
@@ -101,10 +120,47 @@ class EastMoneyMarketData:
         rows = (((payload.get("data") or {}).get(market_symbol) or {}).get("qfqday") or
                 ((payload.get("data") or {}).get(market_symbol) or {}).get("day") or [])
 
-        candles = [Candle(trade_date=row[0], close=float(row[2])) for row in rows if len(row) >= 3]
+        daily_rows = [
+            {
+                "symbol": symbol,
+                "date": row[0],
+                "open": row[1],
+                "close": row[2],
+                "high": row[3],
+                "low": row[4],
+                "volume": row[5],
+            }
+            for row in rows
+            if len(row) >= 6
+        ]
+        candles = [Candle(trade_date=row["date"], close=float(row["close"])) for row in daily_rows]
         if len(candles) < 60:
             raise RuntimeError(f"{symbol} 腾讯日 K 数据不足，无法计算 60 日线。")
+        self._save_daily_rows(daily_rows)
         return candles
+
+    def _save_daily_rows(self, rows: list[dict]) -> None:
+        try:
+            upsert_daily_bars(rows, db_path=self.db_path)
+            logging.info("已写入日 K 数据到 %s，rows=%s", self.db_path, len(rows))
+        except Exception as exc:
+            logging.warning("日 K 数据写入 %s 失败: %s", self.db_path, exc)
+
+    def _save_latest_quote(self, quote: LatestQuote) -> None:
+        try:
+            insert_realtime_quote(
+                symbol=quote.symbol,
+                name=quote.name,
+                price=quote.price,
+                change_percent=quote.change_percent,
+                previous_close=quote.previous_close,
+                open_price=quote.open_price,
+                trade_time=quote.trade_time,
+                db_path=self.db_path,
+            )
+            logging.info("已写入实时行情到 %s: %s %.4f", self.db_path, quote.symbol, quote.price)
+        except Exception as exc:
+            logging.warning("实时行情写入 %s 失败: %s", self.db_path, exc)
 
     def _fetch_json(self, req: urllib.request.Request) -> dict:
         last_error: Optional[Exception] = None

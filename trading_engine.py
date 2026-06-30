@@ -5,6 +5,7 @@ import json
 import logging
 import os
 import shlex
+import shutil
 import subprocess
 import time
 from dataclasses import asdict, dataclass
@@ -436,7 +437,10 @@ class ThsComputerUseExecutor(Executor):
         except Exception as exc:
             logging.warning("Pillow 截图失败，尝试 macOS screencapture: %s", exc)
         try:
-            subprocess.run(["/usr/sbin/screencapture", "-x", str(path)], check=True, capture_output=True, text=True, timeout=8)
+            screencapture = shutil.which("screencapture")
+            if not screencapture:
+                raise RuntimeError("未找到 screencapture 命令")
+            subprocess.run([screencapture, "-x", str(path)], check=True, capture_output=True, text=True, timeout=8)
             logging.info("已保存同花顺校验截图: %s", path)
             return path
         except Exception as exc:
