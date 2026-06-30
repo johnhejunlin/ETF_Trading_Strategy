@@ -17,16 +17,38 @@
 - `trading_strategy.py`：交易信号和策略实现，不放回测报告、指标或撮合逻辑。
 - `trading_engine.py`：交易机器人主流程，当前默认 dry-run。
 - `backtest.py`：回测、回测数据处理、回测撮合、指标和报告生成脚本。
-- `portfolio.json`：本地模拟资金和持仓状态。
-- `signals.csv`：策略信号输出。
-- `trading_engine.log`：运行日志。
-- `trading_engine.monitor.log`：后台托管运行时的实时监控日志。
-- `runtime_state.json`：执行阶段和 GUI 模拟结果等运行状态记录。
-- `screenshots/`：同花顺截图、订单意图和 GUI 校验凭证。
+- `portfolio.json`：本地模拟资金和持仓状态，运行时自动创建，不上传 GitHub。
+- `signals.csv`：策略信号输出，运行时自动追加，不上传 GitHub。
+- `trading_engine.log`：运行日志，不上传 GitHub。
+- `trading_engine.monitor.log`：后台托管运行时的实时监控日志，不上传 GitHub。
+- `runtime_state.json`：执行阶段和 GUI 模拟结果等运行状态记录，不上传 GitHub。
+- `screenshots/`：同花顺截图、订单意图和 GUI 校验凭证，不上传 GitHub。
 - `tests/`：不依赖网络和真实交易的安全单元测试。
 - `requirements.txt`：最小 Python 依赖清单。
-- `backtest_trades*.csv`：回测交易明细。
-- `backtest_*.html`：回测网页报告。
+- `backtest_trades*.csv`：回测交易明细，不上传 GitHub。
+- `backtest_*.html`：回测网页报告，不上传 GitHub。
+
+## GitHub 提交范围
+
+本仓库在 GitHub 上应保持通用、轻量、可复现。提交前必须检查 `git status --short --ignored`，确认本地运行产物被 `.gitignore` 忽略。
+
+应该提交：
+
+- 源码：`trading_engine.py`、`trading_strategy.py`、`market_data.py`、`market_data_store.py`、`backtest.py`、`ths_simulation_bridge.py`
+- 配置与依赖：`config.json`、`requirements.txt`
+- 启停脚本：`Trading_Engine.command`、`automation_start_trading_engine.sh`、`automation_stop_trading_engine.sh`
+- 测试与文档：`tests/`、`README.md`、`agent.md`、`.gitignore`
+
+不应提交：
+
+- 回测结果：`backtest_*.html`、`backtest_*.png`、`backtest_trades_*.csv`
+- 行情数据库：`market_data.sqlite3`
+- 本地运行状态：`portfolio.json`、`runtime_state.json`、`signals.csv`、`STOP_TRADING`
+- 日志：`*.log`
+- GUI 自动化临时产物：`screenshots/*.png`、`screenshots/latest_order_intent.json`、`screenshots/latest_verified_order.json`
+- Python 缓存、虚拟环境和 IDE 配置：`__pycache__/`、`.venv/`、`venv/`、`.idea/`、`.vscode/`
+
+如果这些文件已经被误提交，应使用 `git rm --cached` 从 Git 索引移除，保留本地文件本身。
 
 ## 安全边界
 
