@@ -124,12 +124,32 @@ python3 -m unittest discover -s tests
 - `trading_strategy.py`：策略层，只负责生成交易信号。
 - `backtest.py`：回测层，只负责历史回测、回测撮合、指标和报告。
 - `config.json`：配置中心。
-- `portfolio.json`：本地模拟资金和持仓状态。
-- `signals.csv`：信号和执行审计。
-- `market_data.sqlite3`：行情数据库，保存回测日 K、回测 1 分钟 K 和实时轮询行情。
-- `trading_engine.log`：交易引擎运行日志。
-- `trading_engine.monitor.log`：后台托管运行时建议使用的监控日志。
+- `portfolio.json`：本地模拟资金和持仓状态，运行时自动创建，不上传 GitHub。
+- `signals.csv`：信号和执行审计，运行时自动追加，不上传 GitHub。
+- `market_data.sqlite3`：行情数据库，保存回测日 K、回测 1 分钟 K 和实时轮询行情，不上传 GitHub。
+- `trading_engine.log`：交易引擎运行日志，不上传 GitHub。
+- `trading_engine.monitor.log`：后台托管运行时建议使用的监控日志，不上传 GitHub。
 - `tests/`：安全测试和基础解析测试。
+
+## GitHub 上传范围
+
+为了保持仓库通用、轻量且不包含本地运行状态，GitHub 只上传源码、配置模板、脚本、测试和文档。
+
+会上传：
+
+- 源码：`trading_engine.py`、`trading_strategy.py`、`market_data.py`、`market_data_store.py`、`backtest.py`、`ths_simulation_bridge.py`
+- 配置与依赖：`config.json`、`requirements.txt`
+- 启停脚本：`Trading_Engine.command`、`automation_start_trading_engine.sh`、`automation_stop_trading_engine.sh`
+- 测试与文档：`tests/`、`README.md`、`agent.md`、`.gitignore`
+
+不会上传：
+
+- 回测结果：`backtest_*.html`、`backtest_*.png`、`backtest_trades_*.csv`
+- 行情数据库：`market_data.sqlite3`
+- 本地运行状态：`portfolio.json`、`runtime_state.json`、`signals.csv`、`STOP_TRADING`
+- 日志：`*.log`
+- GUI 自动化临时产物：`screenshots/*.png`、`screenshots/latest_order_intent.json`、`screenshots/latest_verified_order.json`
+- Python 缓存、虚拟环境和 IDE 配置：`__pycache__/`、`.venv/`、`venv/`、`.idea/`、`.vscode/`
 
 后台运行建议：
 
@@ -255,7 +275,7 @@ sqlite3 market_data.sqlite3 ".tables"
 ## 更新记录
 
 - 更新日期：2026-06-30
-- 更新内容：准备上传 GitHub：确认默认仍为 `dry_run` 安全模式，保留运行日志、行情数据库和本地 GUI 校验产物在 `.gitignore` 中，避免提交本地运行状态。
+- 更新内容：准备上传 GitHub：确认默认仍为 `dry_run` 安全模式；补充 GitHub 上传范围说明，排除回测报告、回测交易明细、行情数据库、运行状态、日志和 GUI 临时产物。
 
 - 更新日期：2026-06-24
 - 更新内容：补充同花顺 Mac 模拟交易桥接、安全账户模式校验、GUI 填单验证、行情数据节流与股票代码规范化，并更新自动化启动脚本。

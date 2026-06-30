@@ -16,9 +16,16 @@ market_data.sqlite3
 trade_bot.log
 *.log
 
+# Backtest outputs
+backtest_*.html
+backtest_*.png
+backtest_trades_*.csv
+
 # Runtime state and GUI verification artifacts
 STOP_TRADING
+portfolio.json
 runtime_state.json
+signals.csv
 screenshots/*.png
 screenshots/latest_order_intent.json
 screenshots/latest_verified_order.json
