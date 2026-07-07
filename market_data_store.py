@@ -66,6 +66,8 @@ def init_market_data_db(db_path: Path = MARKET_DATA_DB_PATH) -> None:
             )
             """
         )
+        _ensure_column(conn, "realtime_quotes", "limit_up", "REAL")
+        _ensure_column(conn, "realtime_quotes", "limit_down", "REAL")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_realtime_quotes_lookup ON realtime_quotes(symbol, fetched_at)")
 
 
@@ -118,6 +120,8 @@ def insert_realtime_quote(
     previous_close: Optional[float],
     open_price: Optional[float],
     trade_time: str,
+    limit_up: Optional[float] = None,
+    limit_down: Optional[float] = None,
     db_path: Path = MARKET_DATA_DB_PATH,
     fetched_at: Optional[datetime] = None,
 ) -> None:
@@ -127,9 +131,9 @@ def insert_realtime_quote(
         conn.execute(
             """
             INSERT INTO realtime_quotes(
-                symbol, name, price, change_percent, previous_close, open_price, trade_time, fetched_at
+                symbol, name, price, change_percent, previous_close, open_price, trade_time, limit_up, limit_down, fetched_at
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 symbol,
@@ -139,9 +143,17 @@ def insert_realtime_quote(
                 previous_close,
                 open_price,
                 trade_time,
+                limit_up,
+                limit_down,
                 timestamp,
             ),
         )
+
+
+def _ensure_column(conn: sqlite3.Connection, table: str, column: str, definition: str) -> None:
+    columns = {row[1] for row in conn.execute(f"PRAGMA table_info({table})")}
+    if column not in columns:
+        conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
 
 
 def _optional_float(value: object) -> float | None:

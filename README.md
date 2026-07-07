@@ -1,6 +1,6 @@
 # AI Stock 自动化交易骨架
 
-这是一个面向同花顺桌面 App 的自动化交易骨架。当前默认是 `dry_run` 阶段和 `dry_run` 执行器，只记录计划动作，不会真实下单。
+这是一个面向同花顺桌面 App 的自动化交易骨架。当前默认进入 `sim_run` 阶段，使用同花顺至尊版模拟账户完成模拟交易；真实账户仍被禁用。
 
 ## 当前配置
 
@@ -9,9 +9,9 @@
   - 上午 `09:15-11:30`
   - 下午 `13:00-15:15`
 - 默认执行：
-  - `execution.stage`: `dry_run`
-  - `execution.mode`: `dry_run`
-  - 只写日志和本地模拟状态，不触碰同花顺
+  - `execution.stage`: `sim_run`
+  - `execution.mode`: `ths_computer_use`
+  - 进入同花顺至尊版模拟账户，先同步资金/持仓，字段和截图校验通过后提交模拟买卖单
 - 监控频率：`poll_seconds=60`，每 1 分钟获取一次行情并检查策略
 - 初始资金：`50000`
 - 买入策略：
@@ -113,7 +113,7 @@ python3 -m unittest discover -s tests
 3. `market_data.py` 获取目标股票实时行情和日 K 数据。
 4. `trading_strategy.py` 根据行情、均线、持仓和最新买入价生成买卖信号。
 5. `trading_engine.py` 的风控模块检查白名单、交易时段、交易日、仓位、金额和停止文件。
-6. 执行器根据 `execution.mode` 处理信号；默认 `dry_run` 只记录，不真实下单。
+6. 执行器根据 `execution.mode` 和 `execution.stage` 处理信号；当前默认 `sim_run` 会在同花顺至尊版模拟账户提交订单。
 7. 结果写入日志、`portfolio.json`、`signals.csv` 和 `runtime_state.json`。
 
 文件职责：
@@ -137,7 +137,7 @@ python3 -m unittest discover -s tests
 
 会上传：
 
-- 源码：`trading_engine.py`、`trading_strategy.py`、`market_data.py`、`market_data_store.py`、`backtest.py`、`ths_simulation_bridge.py`
+- 源码：`trading_engine.py`、`trading_strategy.py`、`market_data.py`、`market_data_store.py`、`backtest.py`
 - 配置与依赖：`config.json`、`requirements.txt`
 - 启停脚本：`Trading_Engine.command`、`automation_start_trading_engine.sh`、`automation_stop_trading_engine.sh`
 - 测试与文档：`tests/`、`README.md`、`agent.md`、`.gitignore`
@@ -174,19 +174,62 @@ launchctl remove com.aistock.tradingengine
 `config.json` 中的 `execution.stage` 控制准入闸门：
 
 - `dry_run`：只能使用 `execution.mode=dry_run`。
-- `gui_simulation`：允许激活同花顺、截图、读取校验字段，但 `final_confirm_enabled=false` 时不会最终提交。
+- `gui_simulation`：生成订单意图后等待受控 GUI 自动化完成同花顺界面填单和字段校验；`final_confirm_enabled=false` 时不会最终提交。
+- `sim_run`：使用同花顺至尊版模拟账户执行买入/卖出；必须保持 `execution.ths_account_mode=simulation`，并通过截图/OCR/字段校验。
 - `small_live`：预留小资金实盘阶段，默认买入金额上限 `5000`。
 - `full_live`：预留完整额度阶段，默认买入金额上限 `50000`。
 
 `config.json` 中的 `execution.mode` 控制执行器：
 
-- `dry_run`：默认模式，最安全。
+- `dry_run`：只记录计划动作，不触碰同花顺。
 - `manual_confirm`：人工确认占位，当前不会提交真实订单。
-- `ths_computer_use`：同花顺 GUI 自动化安全框架，当前必须通过截图字段校验，真实提交仍被阻断，直到外部 Computer Use 适配器接入。
+- `ths_computer_use`：同花顺 GUI 协作执行器。后台进程生成订单意图并读取校验文件；真实 App UI 操作可由 Codex Computer Use、AppleScript bridge 或其他受控本机自动化完成。当前默认只允许模拟账户交易，实盘账户仍被阻断。
 
 同花顺 Mac 版交易界面必须先使用 App 内的“模拟”交易选项完成调试。`execution.ths_account_mode` 默认是 `simulation`，`execution.live_account_enabled=false`；在这个状态下，如果 GUI 校验识别到实盘/普通交易界面，系统会阻断执行。
 
-`execution.gui_bridge_command` 用于把 `trading_engine.py` 生成的订单字段传给同花顺模拟交易页。默认桥接脚本会读取 `screenshots/latest_order_intent.json` 中的 `symbol / side / quantity / limit_price`，在同花顺“模拟”页填入代码、买卖方向、数量和价格，并写回 `screenshots/latest_verified_order.json` 供执行器校验；它不会点击最终的“确定买入/卖出”。
+`execution.gui_bridge_command` 和 `execution.account_bridge_command` 可用于后续接入受控 GUI bridge，但默认仍建议留空，由人工、Codex Computer Use 或 AppleScript bridge 按需处理。交易引擎会写出 `screenshots/latest_order_intent.json`，然后等待并读取 `screenshots/latest_verified_order.json`；桥接实现必须写入账户模式、订单字段、提交状态、截图路径和可复盘日志。
+
+`gui_simulation` 阶段只要求完成填单并写回 `submitted=false` 的校验文件。`sim_run` 阶段在字段校验通过且 `execution.final_confirm_enabled=true` 后，可由受控 GUI 自动化点击最终的“买入(模拟账户)”或“卖出(模拟账户)”按钮，并写回 `submitted=true`；后台引擎只认校验文件和截图凭证，不假设具体由哪种工具点击。`execution.codex_computer_use_timeout_seconds` 控制引擎等待回写结果的最长时间。
+
+不要把交易密码写入 `config.json`、脚本或任何会提交到 GitHub 的文件。需要输入交易密码时，只能通过受控交互按需输入，不写入仓库。
+
+账户同步由受控 GUI 自动化读取同花顺模拟账户界面后写入 `screenshots/latest_account_snapshot.json`，格式类似：
+
+```json
+{
+  "account_mode": "simulation",
+  "total_assets": 50123.45,
+  "available_cash": 12345.67,
+  "cash_balance": 20000.0,
+  "market_value": 30123.45,
+  "profit_loss": -88.5,
+  "source": "codex_computer_use",
+  "submitted": false
+}
+```
+
+也可以使用 Apple 原生只读快照桥进行模拟账户诊断：
+
+```bash
+python3 App_Bridge_AppleScript.py
+python3 apple_account_snapshot.py
+python3 apple_account_snapshot.py --write-latest
+```
+
+`App_Bridge_AppleScript.py` 会打开同花顺并导航到 App 内“模拟交易”的持仓页，写出 `screenshots/latest_applescript_bridge_holdings.json` 作为导航校验凭证；它不会填单或提交订单。`apple_account_snapshot.py` 会通过 CoreGraphics 查找同花顺窗口，使用 `screencapture` 截指定窗口，再用 Apple Vision OCR 读取账户页。默认只写 `screenshots/apple_account_snapshot_*.json` 和 `screenshots/latest_account_ocr.json` 诊断文件；只有 `--write-latest` 才会写入 `screenshots/latest_account_snapshot.json`。交易引擎在 `execution.account_snapshot_allowed_sources` 显式包含 `apple_vision_ocr` 时，会先运行 `App_Bridge_AppleScript.py` 校验模拟持仓页，再运行 `apple_account_snapshot.py` 生成标准账户快照；快照没有 `warnings` / `validation_errors` 时才会接受。
+
+`trading_engine.py` 打开同花顺 App 后会优先复用未过期且来源属于 `execution.account_snapshot_allowed_sources` 的账户快照，并把 `portfolio.json` 的可用金额、总资产和目标标的持仓同步到该快照；持续轮询行情和策略时不会重复做账户验证。`execution.force_account_sync_on_app_open=true` 时，启动后会强制要求重新读取账户。无论启动时是否复用快照，真正下单前、下单后仍会强制重新读取账户。
+
+如果快照不存在、过期、无效或账户模式不是 `simulation`，引擎会写出账户同步请求到 `screenshots/latest_codex_computer_use_request.json` 并等待受控 GUI 自动化回写结果，超时后把请求状态标记为 `timed_out` 并停止本次运行，避免用过期的本地资金/持仓继续判断交易。
+
+这里的资金口径必须区分：
+
+- `total_assets` / 总资产：只用于账户跟踪和仓位占比计算，会随行情波动，不作为下单资金依据。
+- `cash` / `available_cash` / 可用金额：交易引擎里的“金额”口径，买入下单和风控只使用这个字段。
+
+当策略生成买入/卖出信号后，交易引擎会在执行前强制重新读取同花顺模拟账户，刷新 `portfolio.json`，并用最新可用金额和持仓重新生成/校验信号。买入金额必须小于等于最新账户可用金额，卖出数量必须小于等于最新账户持仓。订单提交成功后，引擎会再次强制读取账户快照，确认交易后的资金和持仓状态。
+
+执行限价口径：买入指令使用实时行情中的涨停价作为限价，卖出指令使用实时行情中的跌停价作为限价；如果行情源没有提供对应涨跌停价，本轮执行会被阻断。
 
 同花顺 GUI 校验字段可以通过 `execution.verification_fields_path` 指向一个 JSON 文件，格式示例：
 
@@ -270,12 +313,12 @@ sqlite3 market_data.sqlite3 ".tables"
 
 ## 重要说明
 
-真实交易前请先长时间 dry-run 和 GUI 模拟。自动化交易可能因为行情延迟、网络、App 弹窗、坐标偏移等原因产生错误操作。当前代码不会绕过截图/字段校验直接点击真实最终确认。
+真实交易前请先长时间 dry-run、GUI 模拟和 sim-run。自动化交易可能因为行情延迟、网络、App 弹窗、坐标偏移等原因产生错误操作。当前代码只允许在同花顺模拟账户下提交订单，不会绕过截图/字段校验直接点击真实最终确认。
 
 ## 更新记录
 
 - 更新日期：2026-06-30
-- 更新内容：准备上传 GitHub：确认默认仍为 `dry_run` 安全模式；补充 GitHub 上传范围说明，排除回测报告、回测交易明细、行情数据库、运行状态、日志和 GUI 临时产物。
+- 更新内容：准备上传 GitHub：补充 GitHub 上传范围说明，排除回测报告、回测交易明细、行情数据库、运行状态、日志和 GUI 临时产物。
 
 - 更新日期：2026-06-24
 - 更新内容：补充同花顺 Mac 模拟交易桥接、安全账户模式校验、GUI 填单验证、行情数据节流与股票代码规范化，并更新自动化启动脚本。

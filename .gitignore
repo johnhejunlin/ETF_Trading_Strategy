@@ -27,6 +27,11 @@ portfolio.json
 runtime_state.json
 signals.csv
 screenshots/*.png
+screenshots/*.json
+screenshots/apple_account_snapshot_*.json
+screenshots/latest_account_ocr.json
+screenshots/latest_account_snapshot.json
+screenshots/latest_codex_computer_use_request.json
 screenshots/latest_order_intent.json
 screenshots/latest_verified_order.json
 

@@ -8,10 +8,13 @@ cd "$SCRIPT_DIR"
 
 "$PYTHON_BIN" trading_engine.py --clear-stop
 
-if pgrep -fl 'python3.*trading_engine.py' >/dev/null 2>&1; then
+if ps ax -o pid=,command= | awk '$0 ~ /[[:space:]]trading_engine[.]py([[:space:]]|$)/ && $0 !~ /--status/ && $0 !~ /awk / {found=1} END {exit found ? 0 : 1}'; then
   echo "$(date '+%Y-%m-%d %H:%M:%S') trading_engine.py already running; skip start."
   exit 0
 fi
+
+echo "$(date '+%Y-%m-%d %H:%M:%S') opening THS app."
+open -a "同花顺至尊版" >/dev/null 2>&1 || open "/Applications/同花顺至尊版.app" >/dev/null 2>&1 || true
 
 echo "$(date '+%Y-%m-%d %H:%M:%S') opening Trading_Engine.command."
 open "$SCRIPT_DIR/Trading_Engine.command"

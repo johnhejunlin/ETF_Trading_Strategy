@@ -4,11 +4,11 @@ import csv
 import json
 import logging
 import os
-import shlex
 import shutil
 import subprocess
+import sys
 import time
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from datetime import datetime, time as dtime
 from pathlib import Path
 from typing import Optional
@@ -26,6 +26,7 @@ STOP_PATH = ROOT / "STOP_TRADING"
 RUN_STATE_PATH = ROOT / "runtime_state.json"
 SIGNAL_AUDIT_PATH = ROOT / "signals.csv"
 SCREENSHOT_DIR = ROOT / "screenshots"
+CODEX_COMPUTER_USE_REQUEST_PATH = SCREENSHOT_DIR / "latest_codex_computer_use_request.json"
 STOP_POLL_SECONDS = 1
 LOG_SEPARATOR = "————————————————————————————————————————————————————"
 ANSI_RESET = "\033[0m"
@@ -42,7 +43,7 @@ ANSI_PINK = "\033[95m"
 
 VALID_SIDES = {"BUY", "SELL"}
 EXECUTION_MODES = {"dry_run", "manual_confirm", "ths_computer_use"}
-EXECUTION_STAGES = {"dry_run", "gui_simulation", "small_live", "full_live"}
+EXECUTION_STAGES = {"dry_run", "gui_simulation", "sim_run", "small_live", "full_live"}
 THS_ACCOUNT_MODES = {"simulation", "live"}
 
 
@@ -105,6 +106,74 @@ class PortfolioStore:
     def mark_trade(self, symbol: str, today: str) -> None:
         self.position(symbol)["last_trade_date"] = today
 
+    def sync_account_snapshot(self, snapshot: dict, symbols: list[str]) -> None:
+        available_cash = snapshot.get("available_cash")
+        if available_cash is None:
+            available_cash = snapshot.get("cash_balance")
+        if available_cash is not None:
+            self.data["cash"] = float(available_cash)
+            self.data["available_cash"] = float(available_cash)
+        if snapshot.get("total_assets") is not None:
+            self.data["total_assets"] = float(snapshot["total_assets"])
+
+        positions_by_symbol = {
+            str(position.get("symbol")): position
+            for position in snapshot.get("positions", [])
+            if position.get("symbol")
+        }
+        self.data["account_positions"] = [
+            self._account_position_summary_with_snapshot(position, snapshot)
+            for position in snapshot.get("positions", [])
+            if position.get("symbol")
+        ]
+        if not positions_by_symbol:
+            self.data["last_account_snapshot"] = self._snapshot_summary(snapshot)
+            return
+
+        for symbol in sorted(set(symbols) | set(positions_by_symbol)):
+            local = self.position(symbol)
+            account_position = positions_by_symbol.get(symbol)
+            previous_last_trade_date = local.get("last_trade_date")
+            previous_sell_streak = int(local.get("sell_streak") or 0)
+            previous_buy_count = int(local.get("buy_count") or 0)
+            previous_buy_prices = list(local.get("buy_prices") or [])
+            previous_latest_buy_price = local.get("latest_buy_price")
+            if not account_position:
+                local.update(self._empty_position())
+                local["last_trade_date"] = previous_last_trade_date
+                continue
+
+            quantity = int(account_position.get("quantity") or 0)
+            avg_cost = float(account_position.get("avg_cost") or 0.0)
+            position_ratio_pct = self._position_ratio_pct(account_position, snapshot)
+            local.update(
+                {
+                    "quantity": quantity,
+                    "name": account_position.get("name") or local.get("name") or "",
+                    "avg_cost": avg_cost,
+                    "market_value": float(account_position.get("market_value") or 0.0),
+                    "current_price": account_position.get("current_price"),
+                    "account_profit_loss": account_position.get("profit_loss"),
+                    "account_day_profit_loss": account_position.get("day_profit_loss"),
+                    "account_profit_loss_pct": account_position.get("profit_loss_pct"),
+                    "account_position_ratio_pct": position_ratio_pct,
+                    "sellable_quantity": int(account_position.get("sellable_quantity") or 0),
+                    "available_quantity": int(account_position.get("available_quantity") or 0),
+                    "frozen_quantity": int(account_position.get("frozen_quantity") or 0),
+                    "account_source": account_position.get("source"),
+                    "last_trade_date": previous_last_trade_date,
+                    "sell_streak": previous_sell_streak,
+                    "buy_count": previous_buy_count,
+                    "latest_buy_price": previous_latest_buy_price if quantity > 0 else None,
+                    "buy_prices": previous_buy_prices if quantity > 0 else [],
+                }
+            )
+            if quantity <= 0:
+                local.update(self._empty_position())
+                local["last_trade_date"] = previous_last_trade_date
+
+        self.data["last_account_snapshot"] = self._snapshot_summary(snapshot)
+
     def update_max_profit(self, symbol: str, current_price: float) -> None:
         position = self.position(symbol)
         quantity = int(position["quantity"])
@@ -157,6 +226,56 @@ class PortfolioStore:
             "buy_prices": [],
             "last_trade_date": None,
         }
+
+    @staticmethod
+    def _snapshot_summary(snapshot: dict) -> dict:
+        return {
+            "account_mode": snapshot.get("account_mode"),
+            "total_assets": snapshot.get("total_assets"),
+            "available_cash": snapshot.get("available_cash"),
+            "cash_balance": snapshot.get("cash_balance"),
+            "market_value": snapshot.get("market_value"),
+            "profit_loss": snapshot.get("profit_loss"),
+            "source": snapshot.get("source"),
+            "positions_count": len(snapshot.get("positions", [])),
+            "synced_at": datetime.now().isoformat(timespec="seconds"),
+        }
+
+    @staticmethod
+    def _account_position_summary(position: dict) -> dict:
+        return PortfolioStore._account_position_summary_with_snapshot(position, {})
+
+    @staticmethod
+    def _account_position_summary_with_snapshot(position: dict, snapshot: dict) -> dict:
+        return {
+            "symbol": position.get("symbol"),
+            "name": position.get("name"),
+            "quantity": int(position.get("quantity") or 0),
+            "sellable_quantity": int(position.get("sellable_quantity") or 0),
+            "available_quantity": int(position.get("available_quantity") or 0),
+            "frozen_quantity": int(position.get("frozen_quantity") or 0),
+            "avg_cost": position.get("avg_cost"),
+            "current_price": position.get("current_price"),
+            "market_value": position.get("market_value"),
+            "profit_loss": position.get("profit_loss"),
+            "day_profit_loss": position.get("day_profit_loss"),
+            "profit_loss_pct": position.get("profit_loss_pct"),
+            "position_ratio_pct": PortfolioStore._position_ratio_pct(position, snapshot),
+            "source": position.get("source"),
+        }
+
+    @staticmethod
+    def _position_ratio_pct(position: dict, snapshot: dict) -> Optional[float]:
+        market_value = position.get("market_value")
+        total_assets = snapshot.get("total_assets")
+        try:
+            market_value_float = float(market_value)
+            total_assets_float = float(total_assets)
+        except (TypeError, ValueError):
+            return position.get("position_ratio_pct")
+        if total_assets_float <= 0:
+            return position.get("position_ratio_pct")
+        return round((market_value_float / total_assets_float) * 100, 4)
 
     def _load(self, symbols: list[str], initial_cash: float) -> dict:
         if self.path.exists():
@@ -217,28 +336,12 @@ class Notifier:
             logging.warning("未配置 notification.wechat_recipient，微信通知降级为日志。")
             return False
 
-        text = f"{title}\n{message}"
-        script = f'''
-        tell application "WeChat" to activate
-        delay 0.5
-        tell application "System Events"
-            keystroke "f" using command down
-            delay 0.2
-            keystroke {json.dumps(recipient)}
-            delay 0.5
-            key code 36
-            delay 0.5
-            keystroke {json.dumps(text)}
-            key code 36
-        end tell
-        '''
-        try:
-            subprocess.run(["osascript", "-e", script], check=True, capture_output=True, text=True, timeout=10)
-            logging.info("微信客户端通知已发送给 %s。", recipient)
-            return True
-        except (OSError, subprocess.SubprocessError) as exc:
-            logging.error("微信客户端通知失败，已保留日志: %s", exc)
-            return False
+        logging.warning(
+            "微信客户端通知需要 Codex Computer Use 或人工发送，后台脚本不再自动操作 WeChat。recipient=%s message=%s",
+            recipient,
+            f"{title}\n{message}",
+        )
+        return False
 
 
 class RiskManager:
@@ -295,8 +398,13 @@ class RiskManager:
             return RiskDecision(False, f"未知同花顺账户模式: {ths_account_mode}")
         if mode == "ths_computer_use" and ths_account_mode != "simulation" and not self.execution.get("live_account_enabled", False):
             return RiskDecision(False, "同花顺 GUI 调试完成前必须使用模拟交易入口，实盘账户未启用。")
+        if stage == "sim_run" and ths_account_mode != "simulation":
+            return RiskDecision(False, "sim_run 阶段只允许使用同花顺模拟账户。")
 
         if signal.side == "BUY":
+            available_cash = portfolio.cash()
+            if signal.amount() > available_cash:
+                return RiskDecision(False, f"订单金额 {signal.amount():.2f} 超过账户可用金额 {available_cash:.2f}。")
             max_cash = self._stage_cash_limit(stage)
             if signal.amount() > max_cash:
                 return RiskDecision(False, f"订单金额 {signal.amount():.2f} 超过阶段上限 {max_cash:.2f}。")
@@ -308,6 +416,8 @@ class RiskManager:
             return mode == "dry_run"
         if stage == "gui_simulation":
             return mode in {"dry_run", "manual_confirm", "ths_computer_use"}
+        if stage == "sim_run":
+            return mode in {"manual_confirm", "ths_computer_use"}
         if stage in {"small_live", "full_live"}:
             return mode in {"manual_confirm", "ths_computer_use"}
         return False
@@ -318,6 +428,8 @@ class RiskManager:
             return float(limits.get("small_live", self.execution.get("small_live_cash", 5000)))
         if stage == "full_live":
             return float(limits.get("full_live", self.execution.get("max_live_cash", 50000)))
+        if stage == "sim_run":
+            return float(limits.get("sim_run", self.execution.get("max_live_cash", 50000)))
         if stage == "gui_simulation":
             return float(limits.get("gui_simulation", self.execution.get("max_live_cash", 50000)))
         return float(limits.get("dry_run", self.execution.get("max_live_cash", 50000)))
@@ -374,26 +486,26 @@ class ThsComputerUseExecutor(Executor):
         self.price_tolerance = float(self.execution.get("price_tolerance", 0.001))
         self.verification_fields_path = self.execution.get("verification_fields_path", "")
         self.ths_account_mode = str(self.execution.get("ths_account_mode", "simulation"))
-        self.gui_bridge_command = str(self.execution.get("gui_bridge_command", "")).strip()
+        self.codex_wait_seconds = int(self.execution.get("codex_computer_use_timeout_seconds", 180))
 
     def place_order(self, signal: OrderSignal) -> ExecutionResult:
         submitted_at = self._now()
         SCREENSHOT_DIR.mkdir(exist_ok=True)
         intent_path = self._write_intent(signal, submitted_at)
-        self._activate_ths()
-        bridge_path = self._run_gui_bridge(intent_path)
-        screenshot_path = self._capture_screenshot(signal, submitted_at)
-        fields = self._read_verified_fields()
-        if bridge_path and not fields:
-            fields = self._read_verified_fields(bridge_path)
+        self._request_codex_computer_use(signal, intent_path, submit=False)
+        fields = self._read_verified_fields_after(intent_path)
+        screenshot_path = None
 
         if self.require_screenshot_verification:
             ok, message = self._verify_fields(signal, fields)
             if not ok:
                 return ExecutionResult(
                     success=False,
-                    status="verification_failed",
-                    message=f"同花顺界面校验失败: {message}；intent={intent_path}",
+                    status="codex_computer_use_required",
+                    message=(
+                        f"需要使用 Codex Computer Use 完成同花顺界面填单/字段校验: {message}；"
+                        f"intent={intent_path}"
+                    ),
                     submitted_at=submitted_at,
                     verified_fields=fields,
                     screenshot_path=str(screenshot_path) if screenshot_path else None,
@@ -409,21 +521,38 @@ class ThsComputerUseExecutor(Executor):
                 screenshot_path=str(screenshot_path) if screenshot_path else None,
             )
 
+        submitted_fields = self._read_verified_fields_after(intent_path)
+        if not submitted_fields.get("submitted"):
+            self._request_codex_computer_use(signal, intent_path, submit=True)
+            submitted_fields = self._read_verified_fields_after(intent_path)
+        if self.require_screenshot_verification:
+            ok, message = self._verify_fields(signal, submitted_fields)
+            if not ok:
+                return ExecutionResult(
+                    success=False,
+                    status="submit_verification_failed",
+                    message=f"同花顺提交后界面校验失败: {message}；intent={intent_path}",
+                    submitted_at=submitted_at,
+                    verified_fields=submitted_fields,
+                    screenshot_path=None,
+                )
+        if not submitted_fields.get("submitted"):
+            return ExecutionResult(
+                success=False,
+                status="codex_computer_use_submit_required",
+                message="需要使用 Codex Computer Use 完成最终模拟账户提交，并写回 submitted=true，禁止记录成交。",
+                submitted_at=submitted_at,
+                verified_fields=submitted_fields,
+                screenshot_path=None,
+            )
         return ExecutionResult(
-            success=False,
-            status="real_submit_not_implemented",
-            message="真实最终确认点击尚未接入外部 Computer Use 自动化适配器，已阻断。",
+            success=True,
+            status="submitted",
+            message="已确认 Codex Computer Use 完成同花顺最终买入/卖出按钮点击；请以同花顺委托/成交回报为准。",
             submitted_at=submitted_at,
-            verified_fields=fields,
-            screenshot_path=str(screenshot_path) if screenshot_path else None,
+            verified_fields=submitted_fields,
+            screenshot_path=None,
         )
-
-    def _activate_ths(self) -> None:
-        try:
-            subprocess.run(["open", "-a", "同花顺"], check=True, capture_output=True, text=True, timeout=8)
-            time.sleep(1)
-        except (OSError, subprocess.SubprocessError) as exc:
-            raise RuntimeError(f"无法打开或激活同花顺.app: {exc}") from exc
 
     def _capture_screenshot(self, signal: OrderSignal, submitted_at: str) -> Optional[Path]:
         path = SCREENSHOT_DIR / f"ths_{submitted_at.replace(':', '').replace('-', '')}_{signal.symbol}_{signal.side}.png"
@@ -449,30 +578,45 @@ class ThsComputerUseExecutor(Executor):
             logging.warning("截图失败，按配置允许继续: %s", exc)
             return None
 
-    def _run_gui_bridge(self, intent_path: Path) -> Optional[Path]:
-        if not self.gui_bridge_command:
-            return None
-        verification_path = self._verification_fields_path()
-        if verification_path is None:
-            verification_path = SCREENSHOT_DIR / "latest_verified_order.json"
-        verification_path.parent.mkdir(parents=True, exist_ok=True)
-        command = self.gui_bridge_command.format(
-            intent_path=shlex.quote(str(intent_path)),
-            verification_fields_path=shlex.quote(str(verification_path)),
+    def _run_gui_bridge(self, intent_path: Path, submit: bool = False) -> Optional[Path]:
+        raise RuntimeError("已禁用后台 GUI bridge；请使用 Codex Computer Use 完成同花顺界面交互。")
+
+    def _request_codex_computer_use(self, signal: OrderSignal, intent_path: Path, submit: bool = False) -> None:
+        verification_path = self._verification_fields_path() or (SCREENSHOT_DIR / "latest_verified_order.json")
+        payload = {
+            "action": "ths_order_submit" if submit else "ths_order_verify",
+            "created_at": self._now(),
+            "source": "trading_engine",
+            "app": "同花顺至尊版",
+            "account_mode": self.ths_account_mode,
+            "intent_path": str(intent_path),
+            "verification_fields_path": str(verification_path),
+            "order": asdict(signal),
+            "submit": submit,
+            "status": "pending",
+            "instruction": (
+                "请使用 Codex Computer Use 操作同花顺模拟账户界面，填入并校验订单字段；"
+                "完成后写回 verification_fields_path，source 必须为 codex_computer_use。"
+            ),
+        }
+        CODEX_COMPUTER_USE_REQUEST_PATH.parent.mkdir(parents=True, exist_ok=True)
+        CODEX_COMPUTER_USE_REQUEST_PATH.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+        logging.info(
+            "已请求 Codex Computer Use 执行同花顺%s: %s",
+            "最终提交" if submit else "填单校验",
+            CODEX_COMPUTER_USE_REQUEST_PATH,
         )
-        try:
-            subprocess.run(
-                shlex.split(command),
-                check=True,
-                capture_output=True,
-                text=True,
-                timeout=30,
-                cwd=ROOT,
-            )
-            logging.info("同花顺 GUI bridge 已完成填单: %s", verification_path)
-            return verification_path
-        except (OSError, subprocess.SubprocessError) as exc:
-            raise RuntimeError(f"同花顺 GUI bridge 执行失败，禁止继续: {exc}") from exc
+        self._wait_for_codex_verification(intent_path, submit=submit)
+
+    def _wait_for_codex_verification(self, intent_path: Path, submit: bool = False) -> None:
+        deadline = time.monotonic() + max(0, self.codex_wait_seconds)
+        while time.monotonic() <= deadline:
+            fields = self._read_verified_fields_after(intent_path)
+            if fields and (not submit or fields.get("submitted")):
+                return
+            if stop_requested():
+                return
+            time.sleep(1)
 
     def _write_intent(self, signal: OrderSignal, submitted_at: str) -> Path:
         SCREENSHOT_DIR.mkdir(exist_ok=True)
@@ -499,6 +643,14 @@ class ThsComputerUseExecutor(Executor):
         with path.open(encoding="utf-8") as handle:
             return json.load(handle)
 
+    def _read_verified_fields_after(self, intent_path: Path) -> dict:
+        path = self._verification_fields_path()
+        if path is None or not path.exists():
+            return {}
+        if path.stat().st_mtime < intent_path.stat().st_mtime:
+            return {}
+        return self._read_verified_fields(path)
+
     def _verify_fields(self, signal: OrderSignal, fields: dict) -> tuple[bool, str]:
         if not fields:
             return False, "未读取到 OCR/视觉校验字段。"
@@ -506,6 +658,8 @@ class ThsComputerUseExecutor(Executor):
             return False, f"代码不匹配: {fields.get('symbol')}"
         if str(fields.get("side", "")).upper() != signal.side:
             return False, f"方向不匹配: {fields.get('side')}"
+        if str(fields.get("source", "")).strip() != "codex_computer_use":
+            return False, f"校验来源不匹配: {fields.get('source')}"
         account_mode = self._normalize_account_mode(fields.get("account_mode") or fields.get("trade_mode"))
         if account_mode != self.ths_account_mode:
             return False, f"同花顺账户模式不匹配: {fields.get('account_mode') or fields.get('trade_mode')}"
@@ -540,6 +694,315 @@ def build_executor(config: dict) -> Executor:
     if mode == "ths_computer_use":
         return ThsComputerUseExecutor(config)
     raise RuntimeError(f"未知执行模式: {mode}")
+
+
+def sync_portfolio_from_account(
+    config: dict,
+    portfolio: PortfolioStore,
+    runtime_state: RuntimeState,
+    *,
+    force_refresh: bool = False,
+    reason: str = "account_sync",
+) -> tuple[bool, str]:
+    execution = config.get("execution", {})
+    command_template = str(execution.get("account_bridge_command", "")).strip()
+    account_mode = str(execution.get("ths_account_mode", "simulation"))
+    if account_mode != "simulation":
+        return False, "当前阶段只允许同步同花顺模拟账户资金。"
+
+    snapshot_path = resolve_execution_path(execution.get("account_snapshot_path", "screenshots/latest_account_snapshot.json"))
+    snapshot_path.parent.mkdir(parents=True, exist_ok=True)
+    max_age_seconds = int(execution.get("account_snapshot_max_age_seconds", 300))
+    allowed_sources = account_snapshot_allowed_sources(execution)
+    if command_template:
+        return False, "后台账户桥接命令已禁用；请使用 Codex Computer Use 写入同花顺账户快照。"
+
+    min_mtime = time.time() if force_refresh else None
+    snapshot = None if force_refresh else load_recent_account_snapshot(
+        snapshot_path,
+        account_mode,
+        max_age_seconds=max_age_seconds,
+        allowed_sources=allowed_sources,
+    )
+    if snapshot is None:
+        request_codex_account_snapshot(
+            snapshot_path,
+            account_mode,
+            int(execution.get("codex_computer_use_timeout_seconds", 180)),
+            reason=reason,
+            min_mtime=min_mtime,
+            allowed_sources=allowed_sources,
+            symbol=str(config["symbols"][0]),
+            app_name=str(execution.get("ths_app_name") or "同花顺至尊版"),
+            bundle_id=str(execution.get("ths_bundle_id") or "cn.com.10jqka.iHexinFee"),
+            process_name=str(execution.get("ths_process_name") or "EQHexinFee"),
+        )
+        snapshot = load_recent_account_snapshot(
+            snapshot_path,
+            account_mode,
+            max_age_seconds=max_age_seconds,
+            min_mtime=min_mtime,
+            allowed_sources=allowed_sources,
+        )
+    if snapshot is None:
+        return (
+            False,
+            "Codex Computer Use 账户快照不存在、过期或无效: "
+            f"{snapshot_path}；已写入待处理请求: {CODEX_COMPUTER_USE_REQUEST_PATH}。"
+            "请在 Codex 会话中处理该请求并写回快照，或先用已有新快照重新运行。",
+        )
+    logging.info(
+        "使用同花顺账户快照: source=%s path=%s age=%ss",
+        snapshot.get("source"),
+        snapshot_path,
+        snapshot.get("fallback_snapshot_age_seconds"),
+    )
+    if snapshot.get("account_mode") != account_mode:
+        return False, f"同花顺账户模式不匹配: {snapshot.get('account_mode')}"
+    if snapshot.get("available_cash") is None and snapshot.get("cash_balance") is None:
+        return False, "同花顺账户快照缺少可用资金/资金余额。"
+
+    portfolio.sync_account_snapshot(snapshot, config["symbols"])
+    portfolio.save()
+    runtime_state.record_event("last_account_snapshot", portfolio.data.get("last_account_snapshot", {}))
+    positions = snapshot.get("positions", [])
+    logging.info(
+        "已同步同花顺模拟账户: 可用资金=%s 资金余额=%s 总资产=%s 持仓数=%s",
+        format_money(float(snapshot.get("available_cash") or 0.0)),
+        format_money(float(snapshot.get("cash_balance") or 0.0)),
+        format_money(float(snapshot.get("total_assets") or 0.0)),
+        len(positions),
+    )
+    return True, "同花顺模拟账户资金同步完成。"
+
+
+def account_snapshot_allowed_sources(execution: dict) -> set[str]:
+    raw_sources = execution.get("account_snapshot_allowed_sources", ["codex_computer_use"])
+    if isinstance(raw_sources, str):
+        raw_sources = [raw_sources]
+    sources = {str(source).strip() for source in raw_sources if str(source).strip()}
+    return sources or {"codex_computer_use"}
+
+
+def request_codex_account_snapshot(
+    snapshot_path: Path,
+    account_mode: str,
+    wait_seconds: int,
+    *,
+    reason: str = "account_sync",
+    min_mtime: Optional[float] = None,
+    allowed_sources: Optional[set[str]] = None,
+    symbol: str = "588330",
+    app_name: str = "同花顺至尊版",
+    bundle_id: str = "cn.com.10jqka.iHexinFee",
+    process_name: str = "EQHexinFee",
+) -> None:
+    allowed_sources = allowed_sources or {"codex_computer_use"}
+    payload = {
+        "action": "ths_account_snapshot",
+        "created_at": datetime.now().isoformat(timespec="seconds"),
+        "source": "trading_engine",
+        "reason": reason,
+        "app": "同花顺至尊版",
+        "account_mode": account_mode,
+        "account_snapshot_path": str(snapshot_path),
+        "status": "pending",
+        "instruction": (
+            "请使用 Codex Computer Use 读取同花顺模拟账户资金和持仓，写回 account_snapshot_path；"
+            f"source 必须属于 {sorted(allowed_sources)}。"
+        ),
+        "allowed_sources": sorted(allowed_sources),
+    }
+    CODEX_COMPUTER_USE_REQUEST_PATH.parent.mkdir(parents=True, exist_ok=True)
+    CODEX_COMPUTER_USE_REQUEST_PATH.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    logging.info("已请求 Codex Computer Use 同步同花顺账户快照: %s", CODEX_COMPUTER_USE_REQUEST_PATH)
+    deadline = time.monotonic() + max(0, wait_seconds)
+    next_log_at = time.monotonic() + 30
+    next_apple_bridge_at = time.monotonic() if "apple_vision_ocr" in allowed_sources else None
+    while time.monotonic() <= deadline:
+        if next_apple_bridge_at is not None and time.monotonic() >= next_apple_bridge_at:
+            run_apple_account_snapshot_bridge(
+                snapshot_path,
+                symbol=symbol,
+                app_name=app_name,
+                bundle_id=bundle_id,
+                process_name=process_name,
+            )
+            next_apple_bridge_at = time.monotonic() + 10
+        snapshot = load_recent_account_snapshot(
+            snapshot_path,
+            account_mode,
+            max_age_seconds=max(wait_seconds, 1),
+            min_mtime=min_mtime,
+            allowed_sources=allowed_sources,
+        )
+        if snapshot is not None:
+            mark_codex_request_status("completed", "账户快照已写回。")
+            return
+        if stop_requested():
+            mark_codex_request_status("stopped", "检测到停止文件，停止等待账户快照。")
+            return
+        if time.monotonic() >= next_log_at:
+            logging.info("仍在等待 Codex Computer Use 写回账户快照: %s", snapshot_path)
+            next_log_at = time.monotonic() + 30
+        time.sleep(1)
+    mark_codex_request_status("timed_out", f"{wait_seconds}s 内未收到 Codex Computer Use 账户快照。")
+
+
+def run_apple_app_bridge_navigation(
+    symbol: str,
+    *,
+    app_name: str = "同花顺至尊版",
+    bundle_id: str = "cn.com.10jqka.iHexinFee",
+    process_name: str = "EQHexinFee",
+) -> bool:
+    script_path = ROOT / "App_Bridge_AppleScript.py"
+    if not script_path.exists():
+        logging.warning("AppleScript App bridge 脚本不存在: %s", script_path)
+        return False
+    output_path = SCREENSHOT_DIR / "latest_applescript_bridge_holdings.json"
+    try:
+        result = subprocess.run(
+            [
+                sys.executable,
+                str(script_path),
+                "--app-name",
+                app_name,
+                "--bundle-id",
+                bundle_id,
+                "--process-name",
+                process_name,
+                "--symbol",
+                symbol,
+                "--output",
+                str(output_path),
+            ],
+            cwd=ROOT,
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=75,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        logging.warning("AppleScript App bridge 执行失败: %s", exc)
+        return False
+    if result.returncode != 0:
+        logging.warning("AppleScript App bridge 未完成持仓页校验: %s", result.stderr.strip() or result.stdout.strip())
+        return False
+    logging.info("AppleScript App bridge 已进入并校验模拟持仓页: %s", output_path)
+    return True
+
+
+def run_apple_account_snapshot_bridge(
+    snapshot_path: Path,
+    *,
+    symbol: str = "588330",
+    app_name: str = "同花顺至尊版",
+    bundle_id: str = "cn.com.10jqka.iHexinFee",
+    process_name: str = "EQHexinFee",
+) -> None:
+    if not run_apple_app_bridge_navigation(
+        symbol,
+        app_name=app_name,
+        bundle_id=bundle_id,
+        process_name=process_name,
+    ):
+        return
+
+    script_path = ROOT / "apple_account_snapshot.py"
+    if not script_path.exists():
+        logging.warning("Apple Vision OCR 账户快照脚本不存在: %s", script_path)
+        return
+    try:
+        result = subprocess.run(
+            [
+                sys.executable,
+                str(script_path),
+                "--app-name",
+                app_name,
+                "--bundle-id",
+                bundle_id,
+                "--process-name",
+                process_name,
+                "--symbol",
+                symbol,
+                "--write-latest",
+            ],
+            cwd=ROOT,
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=45,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        logging.warning("Apple Vision OCR 账户快照桥执行失败: %s", exc)
+        return
+    if result.returncode != 0:
+        logging.warning("Apple Vision OCR 账户快照桥未写回有效快照: %s", result.stderr.strip() or result.stdout.strip())
+        return
+    try:
+        snapshot = json.loads(result.stdout)
+    except json.JSONDecodeError:
+        logging.warning("Apple Vision OCR 账户快照桥输出不是有效 JSON: %s", result.stdout.strip())
+        return
+    snapshot_path.parent.mkdir(parents=True, exist_ok=True)
+    snapshot_path.write_text(json.dumps(snapshot, ensure_ascii=False, indent=2), encoding="utf-8")
+    logging.info("Apple Vision OCR 账户快照桥已写回: %s", snapshot_path)
+
+
+def mark_codex_request_status(status: str, message: str) -> None:
+    try:
+        payload = json.loads(CODEX_COMPUTER_USE_REQUEST_PATH.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return
+    payload["status"] = status
+    payload["updated_at"] = datetime.now().isoformat(timespec="seconds")
+    payload["message"] = message
+    try:
+        CODEX_COMPUTER_USE_REQUEST_PATH.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    except OSError:
+        logging.warning("更新 Codex Computer Use 请求状态失败: %s", CODEX_COMPUTER_USE_REQUEST_PATH)
+
+
+def load_recent_account_snapshot(
+    snapshot_path: Path,
+    account_mode: str,
+    max_age_seconds: int = 300,
+    min_mtime: Optional[float] = None,
+    allowed_sources: Optional[set[str]] = None,
+) -> Optional[dict]:
+    if not snapshot_path.exists():
+        return None
+    if min_mtime is not None and snapshot_path.stat().st_mtime < min_mtime:
+        return None
+    age_seconds = time.time() - snapshot_path.stat().st_mtime
+    if age_seconds > max_age_seconds:
+        return None
+    try:
+        with snapshot_path.open(encoding="utf-8") as handle:
+            snapshot = json.load(handle)
+    except (OSError, json.JSONDecodeError):
+        return None
+    if snapshot.get("account_mode") != account_mode:
+        return None
+    allowed_sources = allowed_sources or {"codex_computer_use"}
+    if snapshot.get("source") not in allowed_sources:
+        return None
+    if snapshot.get("validation_errors"):
+        return None
+    if snapshot.get("warnings"):
+        return None
+    if snapshot.get("available_cash") is None and snapshot.get("cash_balance") is None:
+        return None
+    snapshot["fallback_snapshot_age_seconds"] = round(age_seconds, 1)
+    return snapshot
+
+
+def resolve_execution_path(value: object) -> Path:
+    path = Path(str(value))
+    if not path.is_absolute():
+        path = ROOT / path
+    return path
 
 
 def load_config() -> dict:
@@ -745,7 +1208,9 @@ def running_engine_processes() -> list[str]:
         pid, command = parts
         if pid == current_pid:
             continue
-        if "trading_engine.py" in command and "python" in command:
+        command_lower = command.lower()
+        executable = Path(command.split(maxsplit=1)[0]).name.lower()
+        if "trading_engine.py" in command and executable.startswith("python"):
             processes.append(f"{pid} {command}")
     return processes
 
@@ -759,33 +1224,30 @@ def latest_log_lines(path: Path = LOG_PATH, limit: int = 8) -> list[str]:
 
 def open_live_log_window(path: Path = LOG_PATH) -> bool:
     path.touch(exist_ok=True)
-    messages = [
-        "AI Stock 交易引擎实时日志",
-        f"日志文件: {path}",
-        "关闭这个窗口只会停止查看日志，不会停止交易引擎。",
-        "停止交易引擎请运行: python3 trading_engine.py --stop",
-        "----------------------------------------",
-    ]
-    message_commands = [f"echo {shlex.quote(message)}" for message in messages]
-    command = "; ".join([
-        f"cd {shlex.quote(str(ROOT))}",
-        "printf '\\033]0;AI Stock 实时日志\\007'",
-        *message_commands,
-        f"tail -f {shlex.quote(str(path))}",
-    ])
-    script = f'''
-    tell application "Terminal"
-        activate
-        do script {json.dumps(command, ensure_ascii=False)}
-    end tell
-    '''
-    try:
-        subprocess.run(["osascript", "-e", script], check=True, capture_output=True, text=True, timeout=10)
-        logging.info("已自动打开实时日志窗口: %s", path)
-        return True
-    except (OSError, subprocess.SubprocessError) as exc:
-        logging.warning("自动打开实时日志窗口失败，请手动运行 tail -f %s。错误: %s", path, exc)
+    logging.info("按 Codex Computer Use 优先原则，不自动操作 Terminal。实时日志命令: tail -f %s", path)
+    return False
+
+
+def open_trading_app(execution: dict) -> bool:
+    app_name = str(execution.get("ths_app_name") or "同花顺至尊版").strip()
+    if not app_name:
         return False
+    try:
+        subprocess.run(["open", "-a", app_name], check=True, capture_output=True, text=True, timeout=10)
+    except (OSError, subprocess.SubprocessError) as exc:
+        fallback = Path("/Applications") / f"{app_name}.app"
+        if fallback.exists():
+            try:
+                subprocess.run(["open", str(fallback)], check=True, capture_output=True, text=True, timeout=10)
+            except (OSError, subprocess.SubprocessError) as fallback_exc:
+                logging.warning("同花顺 App 打开失败: %s；fallback=%s error=%s", app_name, fallback, fallback_exc)
+                return False
+            logging.info("已打开同花顺 App: %s", fallback)
+            return True
+        logging.warning("同花顺 App 打开失败: %s；error=%s", app_name, exc)
+        return False
+    logging.info("已打开同花顺 App: %s", app_name)
+    return True
 
 
 def print_status() -> None:
@@ -819,10 +1281,92 @@ def wait_for_next_poll(seconds: int) -> bool:
     return True
 
 
-def run_once(config: dict, ignore_hours: bool = False, ignore_trade_day: bool = False) -> None:
+def sync_account_after_app_open(config: dict) -> bool:
+    execution = config.get("execution", {})
+    portfolio = PortfolioStore(PORTFOLIO_PATH, config["symbols"], float(config["portfolio"]["initial_cash"]))
+    runtime_state = RuntimeState(RUN_STATE_PATH)
+    ok, sync_message = sync_portfolio_from_account(
+        config,
+        portfolio,
+        runtime_state,
+        force_refresh=bool(execution.get("force_account_sync_on_app_open", False)),
+        reason="app_open",
+    )
+    if not ok:
+        logging.error(sync_message)
+        Notifier(config).notify("AI Stock 账户同步失败", sync_message)
+        return False
+    logging.info("打开同花顺 App 后账户资金/持仓验证完成。")
+    return True
+
+
+def refresh_signal_before_execution(
+    config: dict,
+    portfolio: PortfolioStore,
+    runtime_state: RuntimeState,
+    market_data: EastMoneyMarketData,
+    symbol: str,
+    today: str,
+) -> tuple[Optional[OrderSignal], dict, str]:
+    ok, sync_message = sync_portfolio_from_account(
+        config,
+        portfolio,
+        runtime_state,
+        force_refresh=True,
+        reason="before_order",
+    )
+    if not ok:
+        return None, {}, sync_message
+    refreshed_strategy = TrendPullbackStrategy(config, market_data, portfolio)
+    try:
+        refreshed_signal = refreshed_strategy.generate(symbol, today)
+    except RuntimeError as exc:
+        return None, refreshed_strategy.last_diagnostics, f"{symbol} 二次账户同步后策略检查失败: {exc}"
+    return refreshed_signal, refreshed_strategy.last_diagnostics, "交易前账户资金/持仓验证完成。"
+
+
+def sync_account_after_execution(config: dict, portfolio: PortfolioStore, runtime_state: RuntimeState) -> tuple[bool, str]:
+    return sync_portfolio_from_account(
+        config,
+        portfolio,
+        runtime_state,
+        force_refresh=True,
+        reason="after_order",
+    )
+
+
+def apply_execution_limit_price(signal: OrderSignal, quote) -> OrderSignal:
+    if signal.side == "BUY":
+        price = getattr(quote, "limit_up", None)
+        if price is None or float(price) <= 0:
+            raise RuntimeError(f"{signal.symbol} 缺少涨停价，禁止生成买入执行指令。")
+        return replace(signal, limit_price=float(price), note=f"{signal.note}；执行限价=涨停价{float(price):.4f}")
+    if signal.side == "SELL":
+        price = getattr(quote, "limit_down", None)
+        if price is None or float(price) <= 0:
+            raise RuntimeError(f"{signal.symbol} 缺少跌停价，禁止生成卖出执行指令。")
+        return replace(signal, limit_price=float(price), note=f"{signal.note}；执行限价=跌停价{float(price):.4f}")
+    raise RuntimeError(f"未知买卖方向: {signal.side}")
+
+
+def run_once(
+    config: dict,
+    ignore_hours: bool = False,
+    ignore_trade_day: bool = False,
+    *,
+    sync_account_at_start: bool = True,
+) -> None:
     clock = TradingClock(config["timezone"], config["trading_sessions"])
     notifier = Notifier(config)
     risk_manager = RiskManager(config, clock)
+    portfolio = PortfolioStore(PORTFOLIO_PATH, config["symbols"], float(config["portfolio"]["initial_cash"]))
+    runtime_state = RuntimeState(RUN_STATE_PATH)
+    if sync_account_at_start:
+        ok, sync_message = sync_portfolio_from_account(config, portfolio, runtime_state, reason="run_once_start")
+        if not ok:
+            logging.error(sync_message)
+            notifier.notify("AI Stock 账户同步失败", sync_message)
+            return
 
     if STOP_PATH.exists():
         message = f"检测到一键停止文件: {STOP_PATH}"
@@ -837,11 +1381,9 @@ def run_once(config: dict, ignore_hours: bool = False, ignore_trade_day: bool = 
         return
 
     today = clock.today()
-    portfolio = PortfolioStore(PORTFOLIO_PATH, config["symbols"], float(config["portfolio"]["initial_cash"]))
     market_data = EastMoneyMarketData()
     strategy = TrendPullbackStrategy(config, market_data, portfolio)
     executor = build_executor(config)
-    runtime_state = RuntimeState(RUN_STATE_PATH)
 
     for symbol in config["symbols"]:
         if portfolio.traded_today(symbol, today):
@@ -867,6 +1409,32 @@ def run_once(config: dict, ignore_hours: bool = False, ignore_trade_day: bool = 
             continue
         log_cycle_summary(symbol, quote, portfolio, strategy.last_diagnostics, signal)
         if not signal:
+            portfolio.save()
+            continue
+
+        original_signal = signal
+        signal, refreshed_diagnostics, refresh_message = refresh_signal_before_execution(
+            config,
+            portfolio,
+            runtime_state,
+            market_data,
+            symbol,
+            today,
+        )
+        if not signal:
+            logging.warning("交易前账户二次校验后不再满足交易条件: %s", refresh_message)
+            notifier.notify("AI Stock 交易前校验取消", refresh_message)
+            portfolio.save()
+            continue
+        if asdict(signal) != asdict(original_signal):
+            logging.info("交易前账户二次同步后信号已更新: 原始=%s 最新=%s", original_signal, signal)
+            log_cycle_summary(symbol, quote, portfolio, refreshed_diagnostics, signal)
+        try:
+            signal = apply_execution_limit_price(signal, quote)
+        except RuntimeError as exc:
+            message = f"{symbol} 执行限价生成失败: {exc}"
+            logging.error(message)
+            notifier.notify("AI Stock 执行限价异常", message)
             portfolio.save()
             continue
 
@@ -908,6 +1476,12 @@ def run_once(config: dict, ignore_hours: bool = False, ignore_trade_day: bool = 
             portfolio.apply_fill(signal, signal.limit_price or 0.0)
             portfolio.mark_trade(symbol, today)
             portfolio.save()
+            ok, sync_message = sync_account_after_execution(config, portfolio, runtime_state)
+            if not ok:
+                logging.error("交易后账户资金/持仓验证失败: %s", sync_message)
+                notifier.notify("AI Stock 交易后校验失败", sync_message)
+            else:
+                logging.info("交易后账户资金/持仓验证完成。")
             notifier.notify("AI Stock 执行成功", f"{result.status}: {result.message}")
             logging.info("%s 已记录交易状态: %s", symbol, signal)
             break
@@ -963,11 +1537,22 @@ def main() -> None:
         return
 
     Notifier(config).notify("AI Stock 启动", f"执行模式={execution.get('mode', 'dry_run')} 执行阶段={execution.get('stage', 'dry_run')}")
+    account_synced_after_app_open = False
+    if execution.get("mode") == "ths_computer_use":
+        open_trading_app(execution)
+        account_synced_after_app_open = sync_account_after_app_open(config)
+        if not account_synced_after_app_open:
+            return
     if args.ignore_trade_day and execution.get("mode", "dry_run") != "dry_run":
         raise SystemExit("--ignore-trade-day 只允许搭配 execution.mode=dry_run 使用。")
 
     if args.once:
-        run_once(config, args.ignore_hours, args.ignore_trade_day)
+        run_once(
+            config,
+            args.ignore_hours,
+            args.ignore_trade_day,
+            sync_account_at_start=not account_synced_after_app_open,
+        )
         return
 
     poll_seconds = int(config["poll_seconds"])
@@ -979,7 +1564,12 @@ def main() -> None:
             if stop_requested():
                 logging.info("检测到停止文件，退出持续运行。")
                 break
-            run_once(config, args.ignore_hours, args.ignore_trade_day)
+            run_once(
+                config,
+                args.ignore_hours,
+                args.ignore_trade_day,
+                sync_account_at_start=not account_synced_after_app_open,
+            )
             if not wait_for_next_poll(poll_seconds):
                 break
     except KeyboardInterrupt:

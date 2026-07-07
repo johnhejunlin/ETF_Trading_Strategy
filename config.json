@@ -5,7 +5,7 @@
     ["09:15", "11:30"],
     ["13:00", "15:15"]
   ],
-  "dry_run": true,
+  "dry_run": false,
   "poll_seconds": 60,
   "portfolio": {
     "initial_cash": 50000
@@ -16,23 +16,34 @@
     "allowed_symbols": ["588330"]
   },
   "execution": {
-    "mode": "dry_run",
-    "stage": "dry_run",
+    "mode": "ths_computer_use",
+    "stage": "sim_run",
     "ths_account_mode": "simulation",
     "live_account_enabled": false,
     "max_live_cash": 50000,
     "small_live_cash": 5000,
+    "ths_app_name": "同花顺至尊版",
+    "ths_bundle_id": "cn.com.10jqka.iHexinFee",
+    "ths_process_name": "EQHexinFee",
+    "trade_password_env": "THS_TRADE_PASSWORD",
     "stage_cash_limits": {
       "dry_run": 50000,
       "gui_simulation": 50000,
+      "sim_run": 50000,
       "small_live": 5000,
       "full_live": 50000
     },
     "require_screenshot_verification": true,
-    "final_confirm_enabled": false,
+    "final_confirm_enabled": true,
     "price_tolerance": 0.001,
     "verification_fields_path": "screenshots/latest_verified_order.json",
-    "gui_bridge_command": "python3 ths_simulation_bridge.py --intent {intent_path} --verification {verification_fields_path}"
+    "account_snapshot_path": "screenshots/latest_account_snapshot.json",
+    "account_snapshot_max_age_seconds": 3600,
+    "account_snapshot_allowed_sources": ["codex_computer_use", "apple_vision_ocr"],
+    "force_account_sync_on_app_open": false,
+    "codex_computer_use_timeout_seconds": 180,
+    "account_bridge_command": "",
+    "gui_bridge_command": ""
   },
   "notification": {
     "channel": "wechat_client",

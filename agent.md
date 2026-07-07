@@ -34,7 +34,7 @@
 
 应该提交：
 
-- 源码：`trading_engine.py`、`trading_strategy.py`、`market_data.py`、`market_data_store.py`、`backtest.py`、`ths_simulation_bridge.py`
+- 源码：`trading_engine.py`、`trading_strategy.py`、`market_data.py`、`market_data_store.py`、`backtest.py`
 - 配置与依赖：`config.json`、`requirements.txt`
 - 启停脚本：`Trading_Engine.command`、`automation_start_trading_engine.sh`、`automation_stop_trading_engine.sh`
 - 测试与文档：`tests/`、`README.md`、`agent.md`、`.gitignore`
@@ -61,12 +61,20 @@
    - 单日最大亏损
    - 一键停止机制
    - 下单前后的日志和截图/凭证
-4. Computer Use / GUI 自动点击只能作为受控辅助方案，不能作为高信任核心执行层。
+4. Computer Use / AppleScript / GUI 自动点击只能作为受控辅助方案，不能作为高信任核心执行层。
 5. 如果未来接入券商 API，应优先使用官方、稳定、可审计接口。
 6. 下单逻辑必须能解释、能回放、能从日志复盘。
 7. `execution.mode=ths_computer_use` 仍必须通过截图/字段校验；不得为了“跑通”而绕过 `require_screenshot_verification`。
 8. 同花顺 Mac 版在完全调试完成前必须使用 App 内“模拟”交易选项；保持 `execution.ths_account_mode=simulation` 和 `execution.live_account_enabled=false`。
-9. `small_live` 之前必须先完成 dry-run 和 GUI 模拟阶段，不能直接把 `final_confirm_enabled` 打开。
+9. `sim_run` 是同花顺模拟账户提交阶段，必须保持 `execution.ths_account_mode=simulation`；`small_live` 之前必须先完成 dry-run、GUI 模拟和 sim-run 阶段，不能直接切到实盘。
+10. AppleScript 允许用于同花顺 App 激活、窗口定位、模拟账户填单和模拟账户提交；使用前必须有用户明确要求，且必须保留账户模式校验、订单字段校验、截图/日志凭证和提交结果记录。AppleScript 不得用于实盘提交，除非后续另行完成小资金实盘阶段的显式授权和风控配置。
+
+## App 交互方式
+
+- 任何需要操作同花顺、浏览器或本机 App UI 的任务，可使用 Codex Computer Use、AppleScript、Apple Vision OCR 或其他受控本机自动化工具；选择依据是稳定性、可审计性和当前任务需求。
+- 当前项目不要使用 Hermes/CUA 的 `cua-driver` 作为 App 交互层实现路径；只有在用户明确要求临时诊断，且必须说明这是降级/备选路径时，才允许调用。
+- 同花顺相关 UI 调试、账户同步验证、填单验证和截图校验，可通过 Codex Computer Use 或 AppleScript 完成；无论使用哪种方式，都必须确认 App 内为“模拟”交易入口，并写出可复盘的字段、截图和日志凭证。
+- 用户已授权将同花顺模拟账户登录密码保存到 macOS Keychain，service 名称为 `ETF_Trading_System_THS_Simulation_Password`。需要登录模拟账户时，可用 `security find-generic-password -a "$USER" -s "ETF_Trading_System_THS_Simulation_Password" -w` 读取后通过受控交互输入；不得把密码写入仓库、配置、脚本、日志或回复正文。
 
 ## 开发原则
 

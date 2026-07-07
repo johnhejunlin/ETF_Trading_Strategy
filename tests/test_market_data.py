@@ -24,7 +24,17 @@ class MarketDataTests(unittest.TestCase):
         self.assertEqual(EastMoneyMarketData._normalize_symbol(" sz000001 "), "000001")
 
     def test_parse_tencent_quote(self) -> None:
-        raw = 'v_sh588330="1~科创综指ETF华夏~588330~1.290~1.280~1.281~1000~0~0~0~0~0~0~0~0~0~0~0~0~0~0~0~0~0~0~0~0~0~0~0~20260615103000~0";'
+        parts = ["0"] * 49
+        parts[0] = "1"
+        parts[1] = "科创综指ETF华夏"
+        parts[2] = "588330"
+        parts[3] = "1.290"
+        parts[4] = "1.280"
+        parts[5] = "1.281"
+        parts[30] = "20260615103000"
+        parts[47] = "1.536"
+        parts[48] = "1.024"
+        raw = f'v_sh588330="{"~".join(parts)}";'
 
         quote = EastMoneyMarketData._parse_tencent_quote("SH588330", raw)
 
@@ -35,9 +45,21 @@ class MarketDataTests(unittest.TestCase):
         self.assertEqual(quote.previous_close, 1.28)
         self.assertEqual(quote.open_price, 1.281)
         self.assertEqual(quote.trade_time, "20260615103000")
+        self.assertEqual(quote.limit_up, 1.536)
+        self.assertEqual(quote.limit_down, 1.024)
 
     def test_latest_quote_is_saved_to_sqlite(self) -> None:
-        raw = 'v_sh588330="1~科创综指ETF华夏~588330~1.290~1.280~1.281~1000~0~0~0~0~0~0~0~0~0~0~0~0~0~0~0~0~0~0~0~0~0~0~0~20260615103000~0";'
+        parts = ["0"] * 49
+        parts[0] = "1"
+        parts[1] = "科创综指ETF华夏"
+        parts[2] = "588330"
+        parts[3] = "1.290"
+        parts[4] = "1.280"
+        parts[5] = "1.281"
+        parts[30] = "20260615103000"
+        parts[47] = "1.536"
+        parts[48] = "1.024"
+        raw = f'v_sh588330="{"~".join(parts)}";'
         with tempfile.TemporaryDirectory() as tempdir:
             db_path = Path(tempdir) / "market_data.sqlite3"
             response = mock.MagicMock()
@@ -47,11 +69,11 @@ class MarketDataTests(unittest.TestCase):
 
             with sqlite3.connect(db_path) as conn:
                 row = conn.execute(
-                    "SELECT symbol, name, price, previous_close, open_price, trade_time FROM realtime_quotes"
+                    "SELECT symbol, name, price, previous_close, open_price, trade_time, limit_up, limit_down FROM realtime_quotes"
                 ).fetchone()
 
         self.assertEqual(quote.price, 1.29)
-        self.assertEqual(row, ("588330", "科创综指ETF华夏", 1.29, 1.28, 1.281, "20260615103000"))
+        self.assertEqual(row, ("588330", "科创综指ETF华夏", 1.29, 1.28, 1.281, "20260615103000", 1.536, 1.024))
 
     def test_daily_candles_are_saved_to_sqlite(self) -> None:
         rows = []

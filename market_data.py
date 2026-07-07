@@ -29,6 +29,8 @@ class LatestQuote:
     previous_close: Optional[float]
     open_price: Optional[float]
     trade_time: str
+    limit_up: Optional[float] = None
+    limit_down: Optional[float] = None
 
 
 class EastMoneyMarketData:
@@ -156,6 +158,8 @@ class EastMoneyMarketData:
                 previous_close=quote.previous_close,
                 open_price=quote.open_price,
                 trade_time=quote.trade_time,
+                limit_up=quote.limit_up,
+                limit_down=quote.limit_down,
                 db_path=self.db_path,
             )
             logging.info("已写入实时行情到 %s: %s %.4f", self.db_path, quote.symbol, quote.price)
@@ -205,6 +209,8 @@ class EastMoneyMarketData:
             previous_close=_optional_float(parts[4]),
             open_price=_optional_float(parts[5]),
             trade_time=parts[30] if len(parts) > 30 else "",
+            limit_up=_optional_float(parts[47]) if len(parts) > 47 else None,
+            limit_down=_optional_float(parts[48]) if len(parts) > 48 else None,
         )
 
     @staticmethod
