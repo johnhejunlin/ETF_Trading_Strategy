@@ -10,8 +10,22 @@ echo "工作目录: $SCRIPT_DIR"
 echo "启动命令: $PYTHON_BIN trading_engine.py"
 echo
 
-echo "打开同花顺至尊版..."
-open -a "同花顺至尊版" >/dev/null 2>&1 || open "/Applications/同花顺至尊版.app" >/dev/null 2>&1 || true
+echo "打开同花顺..."
+open -a "同花顺" >/dev/null 2>&1 || open "/Applications/同花顺.app" >/dev/null 2>&1 || true
+echo
+
+if ! accessibility_probe="$("$PYTHON_BIN" -c 'import subprocess, sys; result = subprocess.run(["osascript", "-e", "tell application \"System Events\" to tell process \"Terminal\" to return count of UI elements of window 1"], capture_output=True, text=True); sys.stderr.write(result.stderr or result.stdout) if result.returncode else None; raise SystemExit(result.returncode)' 2>&1)"; then
+  python_app_path="$("$PYTHON_BIN" -c 'import sys; from pathlib import Path; print(Path(sys.prefix) / "Resources" / "Python.app")')"
+  echo "Python 子进程无法使用 macOS 辅助功能，交易引擎未启动。"
+  echo "$accessibility_probe"
+  echo "请把下面的 Python.app 添加到 系统设置 → 隐私与安全性 → 辅助功能 并开启："
+  echo "$python_app_path"
+  echo "然后 Command+Q 完全退出并重启 Terminal。"
+  echo
+  read "answer?按回车关闭窗口。"
+  exit 1
+fi
+echo "Python → osascript 辅助功能预检通过。"
 echo
 
 if [[ -f STOP_TRADING ]]; then
@@ -33,7 +47,10 @@ if [[ -n "$running_processes" ]]; then
   fi
 fi
 
-echo "账户同步由 trading_engine 发起 Codex Computer Use 请求；若快照缺失或过期，引擎会等待回写。"
+echo "账户同步由 trading_engine 发起 AppleScript bridge 请求；若快照缺失或过期，引擎会等待回写。"
 echo
 
-exec "$PYTHON_BIN" trading_engine.py
+# Keep the Terminal-owned shell alive. Replacing it with Python via `exec`
+# changes the process responsible for later osascript Accessibility requests.
+"$PYTHON_BIN" trading_engine.py
+exit $?

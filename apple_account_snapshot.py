@@ -27,6 +27,9 @@ SCREENSHOTS = ROOT / "screenshots"
 DEFAULT_LATEST = SCREENSHOTS / "latest_account_snapshot.json"
 DEFAULT_OCR = SCREENSHOTS / "latest_account_ocr.json"
 SNAPSHOT_SOURCE = "apple_vision_ocr"
+DEFAULT_APP_NAME = "同花顺"
+DEFAULT_BUNDLE_ID = "cn.com.10jqka.macstock"
+DEFAULT_PROCESS_NAME = "同花顺"
 
 
 SWIFT_OCR = r'''
@@ -253,7 +256,7 @@ def parse_money(value: str) -> float | None:
         return None
 
 
-NUMBER_RE = re.compile(r"[-−]?\d{1,3}(?:[,，]\d{3})*(?:\.\d+)?|[-−]?\d+(?:\.\d+)?")
+NUMBER_RE = re.compile(r"[-−]?(?:\d{1,3}(?:[,，]\d{3})+|\d+)(?:\.\d+)?")
 
 
 def number_after_label(raw_text: str, labels: list[str], limit: int = 80) -> float | None:
@@ -323,6 +326,70 @@ def value_below_label(
     return candidates[0][1]
 
 
+def value_right_of_label(
+    items: list[OcrText],
+    labels: list[str],
+    *,
+    max_dx: float = 0.12,
+    max_dy: float = 0.018,
+    max_value_x: float | None = None,
+) -> float | None:
+    """Read a numeric value on the same row to the right of an account label."""
+    labels_found = [
+        item
+        for item in items
+        if any(text_matches_label(item.text, label) for label in labels)
+    ]
+    candidates: list[tuple[float, float]] = []
+    for label in labels_found:
+        label_right = label.x + label.width
+        label_y = label.y + label.height / 2
+        for item in items:
+            value = first_number(item.text)
+            if value is None:
+                continue
+            item_x = item.x + item.width / 2
+            item_y = item.y + item.height / 2
+            dx = item_x - label_right
+            dy = abs(item_y - label_y)
+            if 0 <= dx <= max_dx and dy <= max_dy and (max_value_x is None or item_x <= max_value_x):
+                candidates.append((dy * 4 + dx, value))
+    if not candidates:
+        return None
+    candidates.sort(key=lambda pair: pair[0])
+    return candidates[0][1]
+
+
+def value_below_header(
+    items: list[OcrText],
+    labels: list[str],
+    *,
+    row_symbol_y: float | None = None,
+    max_dx: float = 0.035,
+    max_dy: float = 0.035,
+) -> float | None:
+    """Read a holdings-table value directly below a named column header."""
+    headers = [item for item in items if item.text.replace(" ", "") in labels]
+    candidates: list[tuple[float, float]] = []
+    for header in headers:
+        header_x = header.x + header.width / 2
+        for item in items:
+            value = first_number(item.text)
+            if value is None:
+                continue
+            item_x = item.x + item.width / 2
+            dy = header.y - item.y
+            if not (0 < dy <= max_dy and abs(header_x - item_x) <= max_dx):
+                continue
+            if row_symbol_y is not None and abs(item.y - row_symbol_y) > 0.018:
+                continue
+            candidates.append((abs(header_x - item_x) + dy, value))
+    if not candidates:
+        return None
+    candidates.sort(key=lambda pair: pair[0])
+    return candidates[0][1]
+
+
 def normalize_ocr_text(items: list[OcrText]) -> list[OcrText]:
     return sorted(items, key=lambda item: (-item.y, item.x))
 
@@ -348,7 +415,22 @@ def parse_position(raw_text: str, symbol: str, items: list[OcrText]) -> dict[str
     if symbol not in raw_text:
         return None
     symbol_items = [item for item in items if symbol in item.text]
-    symbol_y = symbol_items[0].y if symbol_items else None
+    table_headers = [
+        item
+        for item in items
+        if item.text.replace(" ", "") in {"证券代码", "证券名称", "实际数量", "股票余额", "可用余额"}
+    ]
+    table_header_y = max((item.y for item in table_headers), default=None)
+    table_symbol_items = [
+        item
+        for item in symbol_items
+        if table_header_y is not None and 0 < table_header_y - item.y <= 0.05
+    ]
+    if table_symbol_items:
+        table_symbol_items.sort(key=lambda item: table_header_y - item.y)
+        symbol_y = table_symbol_items[0].y
+    else:
+        symbol_y = symbol_items[0].y if symbol_items else None
     row_items = [
         item.text
         for item in items
@@ -381,6 +463,35 @@ def parse_position(raw_text: str, symbol: str, items: list[OcrText]) -> dict[str
         position["profit_loss"] = pnl_values[0]
     if position_ratio_values:
         position["position_ratio"] = position_ratio_values[0] / 100.0
+
+    # Ordinary macOS THS exposes a desktop-style holdings table with separate
+    # headers instead of the compact "持仓/可用" and "成本/现价" columns.
+    actual_quantity = value_below_header(items, ["实际数量"], row_symbol_y=symbol_y)
+    stock_balance = value_below_header(items, ["股票余额"], row_symbol_y=symbol_y)
+    available_quantity = value_below_header(items, ["可用余额"], row_symbol_y=symbol_y)
+    current_price = value_below_header(items, ["市价"], row_symbol_y=symbol_y)
+    profit_loss = value_below_header(items, ["盈亏"], row_symbol_y=symbol_y)
+    if actual_quantity is not None:
+        position["quantity"] = int(actual_quantity)
+    elif stock_balance is not None:
+        position["quantity"] = int(stock_balance)
+    if available_quantity is not None:
+        position["sellable_quantity"] = int(available_quantity)
+        position["available_quantity"] = int(available_quantity)
+    elif stock_balance is not None:
+        position["sellable_quantity"] = int(stock_balance)
+        position["available_quantity"] = int(stock_balance)
+    if current_price is not None:
+        position["current_price"] = current_price
+    if profit_loss is not None:
+        position["profit_loss"] = profit_loss
+
+    average_match = re.search(r"均价[:：]\s*(\d+(?:\.\d+)?)", raw_text)
+    latest_match = re.search(r"最新[:：]\s*(\d+(?:\.\d+)?)", raw_text)
+    if average_match:
+        position["avg_cost"] = float(average_match.group(1))
+    if latest_match and "current_price" not in position:
+        position["current_price"] = float(latest_match.group(1))
     return position
 
 
@@ -443,15 +554,46 @@ def build_snapshot(
 ) -> dict[str, Any]:
     ordered = normalize_ocr_text(items)
     raw_text = " || ".join(item.text for item in ordered)
-    total_assets = value_below_label(ordered, ["总资产"], min_label_y=0.75) or number_after_label(raw_text, ["总资产"])
-    available_cash = value_below_label(ordered, ["可用资金", "可用"], min_label_y=0.72) or number_after_label(raw_text, ["可用资金", "可用"])
-    cash_balance = value_below_label(ordered, ["资金余额", "余额"]) or number_after_label(raw_text, ["资金余额", "余额"])
-    market_value = value_below_label(ordered, ["总市值"], min_label_y=0.72) or number_after_label(raw_text, ["总市值"])
-    profit_loss = value_below_label(ordered, ["总盈亏"], min_label_y=0.75) or number_after_label(raw_text, ["总盈亏"])
+    total_assets = (
+        value_right_of_label(ordered, ["总资产"], max_value_x=0.22)
+        or value_below_label(ordered, ["总资产"], min_label_y=0.75)
+        or number_after_label(raw_text, ["总资产"])
+    )
+    available_cash = (
+        value_right_of_label(ordered, ["可用金额", "可用资金", "可用"], max_value_x=0.22)
+        or value_below_label(ordered, ["可用金额", "可用资金", "可用"], min_label_y=0.72)
+        or number_after_label(raw_text, ["可用金额", "可用资金", "可用"])
+    )
+    cash_balance = (
+        value_right_of_label(ordered, ["资金余额", "余额"], max_value_x=0.22)
+        or value_below_label(ordered, ["资金余额", "余额"])
+        or number_after_label(raw_text, ["资金余额", "余额"])
+    )
+    market_value = (
+        value_right_of_label(ordered, ["总市值"], max_value_x=0.22)
+        or value_below_label(ordered, ["总市值"], min_label_y=0.72)
+        or number_after_label(raw_text, ["总市值"])
+    )
+    profit_loss = (
+        value_right_of_label(ordered, ["总盈亏"], max_value_x=0.22)
+        or value_below_label(ordered, ["总盈亏"], min_label_y=0.75)
+        or number_after_label(raw_text, ["总盈亏"])
+    )
     position = parse_position(raw_text, symbol, ordered)
+    if (
+        position
+        and market_value is not None
+        and any(item.text.replace(" ", "") == "实际数量" for item in ordered)
+    ):
+        position["market_value"] = market_value
+        if profit_loss is not None:
+            position["profit_loss"] = profit_loss
 
     anchors = {
-        "simulation": any(key in raw_text for key in ["模拟炒股", "模拟账户", "模拟交易", "大玩家"]),
+        "simulation": any(
+            key in raw_text
+            for key in ["模拟炒股", "模拟账户", "模拟交易", "模拟练习", "楧拟练习", "梗拟练习", "大玩家"]
+        ),
         "total_assets": total_assets is not None,
         "available_cash": available_cash is not None or cash_balance is not None,
         "position_area": any(key in raw_text for key in ["持仓股", "持仓"]),
@@ -493,9 +635,9 @@ def build_snapshot(
 
 def main() -> int:
     parser = argparse.ArgumentParser(description="Read THS simulated account snapshot with Apple Vision OCR")
-    parser.add_argument("--app-name", default="同花顺至尊版")
-    parser.add_argument("--bundle-id", default="cn.com.10jqka.iHexinFee")
-    parser.add_argument("--process-name", default="EQHexinFee")
+    parser.add_argument("--app-name", default=DEFAULT_APP_NAME)
+    parser.add_argument("--bundle-id", default=DEFAULT_BUNDLE_ID)
+    parser.add_argument("--process-name", default=DEFAULT_PROCESS_NAME)
     parser.add_argument("--symbol", default="588330")
     parser.add_argument("--write-latest", action="store_true", help="also write screenshots/latest_account_snapshot.json")
     parser.add_argument("--output", type=Path, default=None, help="diagnostic JSON output path")

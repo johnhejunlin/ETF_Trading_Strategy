@@ -11,6 +11,7 @@ __pycache__/
 
 # Database
 market_data.sqlite3
+app_ui_map.sqlite3
 
 # Logs
 trade_bot.log
@@ -31,7 +32,7 @@ screenshots/*.json
 screenshots/apple_account_snapshot_*.json
 screenshots/latest_account_ocr.json
 screenshots/latest_account_snapshot.json
-screenshots/latest_codex_computer_use_request.json
+screenshots/latest_applescript_bridge_request.json
 screenshots/latest_order_intent.json
 screenshots/latest_verified_order.json
 

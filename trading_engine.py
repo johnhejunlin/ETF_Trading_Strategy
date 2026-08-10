@@ -4,6 +4,7 @@ import csv
 import json
 import logging
 import os
+import shlex
 import shutil
 import subprocess
 import sys
@@ -26,7 +27,14 @@ STOP_PATH = ROOT / "STOP_TRADING"
 RUN_STATE_PATH = ROOT / "runtime_state.json"
 SIGNAL_AUDIT_PATH = ROOT / "signals.csv"
 SCREENSHOT_DIR = ROOT / "screenshots"
-CODEX_COMPUTER_USE_REQUEST_PATH = SCREENSHOT_DIR / "latest_codex_computer_use_request.json"
+APPLESCRIPT_BRIDGE_REQUEST_PATH = SCREENSHOT_DIR / "latest_applescript_bridge_request.json"
+SCREENSHOT_CLEANUP_SUFFIXES = {".png", ".json"}
+SCREENSHOT_CLEANUP_DEFAULTS = {
+    "enabled": True,
+    "retention_days": 7,
+    "max_files": 300,
+    "keep_latest_files": True,
+}
 STOP_POLL_SECONDS = 1
 LOG_SEPARATOR = "————————————————————————————————————————————————————"
 ANSI_RESET = "\033[0m"
@@ -42,7 +50,7 @@ ANSI_PINK = "\033[95m"
 
 
 VALID_SIDES = {"BUY", "SELL"}
-EXECUTION_MODES = {"dry_run", "manual_confirm", "ths_computer_use"}
+EXECUTION_MODES = {"dry_run", "manual_confirm", "ths_applescript"}
 EXECUTION_STAGES = {"dry_run", "gui_simulation", "sim_run", "small_live", "full_live"}
 THS_ACCOUNT_MODES = {"simulation", "live"}
 
@@ -61,6 +69,16 @@ class ExecutionResult:
 class RiskDecision:
     allowed: bool
     reason: str
+
+
+@dataclass(frozen=True)
+class ScreenshotCleanupResult:
+    scanned: int
+    deleted: int
+    kept: int
+    retained_latest: int
+    retention_days: int
+    max_files: int
 
 
 class TradingClock:
@@ -103,8 +121,17 @@ class PortfolioStore:
     def traded_today(self, symbol: str, today: str) -> bool:
         return self.position(symbol).get("last_trade_date") == today
 
+    def daily_order_count(self, today: str) -> int:
+        counts = self.data.get("daily_order_counts", {})
+        return int(counts.get(today) or 0)
+
     def mark_trade(self, symbol: str, today: str) -> None:
         self.position(symbol)["last_trade_date"] = today
+        counts = self.data.setdefault("daily_order_counts", {})
+        counts[today] = int(counts.get(today) or 0) + 1
+        # This is local runtime state; retain only a small audit window.
+        for date_key in sorted(counts)[:-31]:
+            counts.pop(date_key, None)
 
     def sync_account_snapshot(self, snapshot: dict, symbols: list[str]) -> None:
         available_cash = snapshot.get("available_cash")
@@ -337,7 +364,7 @@ class Notifier:
             return False
 
         logging.warning(
-            "微信客户端通知需要 Codex Computer Use 或人工发送，后台脚本不再自动操作 WeChat。recipient=%s message=%s",
+            "微信客户端通知需要人工发送，后台脚本不自动操作 WeChat。recipient=%s message=%s",
             recipient,
             f"{title}\n{message}",
         )
@@ -374,7 +401,7 @@ class RiskManager:
             return RiskDecision(False, "当前不是交易日，禁止下单。")
         if not ignore_hours and not self.clock.is_open():
             return RiskDecision(False, "当前不在配置交易时段内，禁止下单。")
-        if portfolio.traded_today(signal.symbol, today):
+        if portfolio.traded_today(signal.symbol, today) and not self.allows_repeated_symbol_trades():
             return RiskDecision(False, f"{signal.symbol} 今日已执行过交易。")
 
         position = portfolio.position(signal.symbol)
@@ -384,6 +411,8 @@ class RiskManager:
         max_orders_per_day = int(self.risk.get("max_orders_per_day", 1))
         if max_orders_per_day < 1:
             return RiskDecision(False, "risk.max_orders_per_day 必须至少为 1。")
+        if portfolio.daily_order_count(today) >= max_orders_per_day:
+            return RiskDecision(False, f"今日已达到最大交易次数 {max_orders_per_day}。")
 
         stage = self.execution.get("stage", "dry_run")
         mode = self.execution.get("mode", "dry_run")
@@ -396,7 +425,7 @@ class RiskManager:
         ths_account_mode = str(self.execution.get("ths_account_mode", "simulation"))
         if ths_account_mode not in THS_ACCOUNT_MODES:
             return RiskDecision(False, f"未知同花顺账户模式: {ths_account_mode}")
-        if mode == "ths_computer_use" and ths_account_mode != "simulation" and not self.execution.get("live_account_enabled", False):
+        if mode == "ths_applescript" and ths_account_mode != "simulation" and not self.execution.get("live_account_enabled", False):
             return RiskDecision(False, "同花顺 GUI 调试完成前必须使用模拟交易入口，实盘账户未启用。")
         if stage == "sim_run" and ths_account_mode != "simulation":
             return RiskDecision(False, "sim_run 阶段只允许使用同花顺模拟账户。")
@@ -411,15 +440,21 @@ class RiskManager:
 
         return RiskDecision(True, "风控通过。")
 
+    def allows_repeated_symbol_trades(self) -> bool:
+        return (
+            str(self.execution.get("ths_account_mode", "simulation")) == "simulation"
+            and bool(self.execution.get("simulation_allow_repeated_symbol_trades", False))
+        )
+
     def _stage_allows_mode(self, stage: str, mode: str) -> bool:
         if stage == "dry_run":
             return mode == "dry_run"
         if stage == "gui_simulation":
-            return mode in {"dry_run", "manual_confirm", "ths_computer_use"}
+            return mode in {"dry_run", "manual_confirm", "ths_applescript"}
         if stage == "sim_run":
-            return mode in {"manual_confirm", "ths_computer_use"}
+            return mode in {"manual_confirm", "ths_applescript"}
         if stage in {"small_live", "full_live"}:
-            return mode in {"manual_confirm", "ths_computer_use"}
+            return mode in {"manual_confirm", "ths_applescript"}
         return False
 
     def _stage_cash_limit(self, stage: str) -> float:
@@ -476,7 +511,7 @@ class ManualConfirmExecutor(Executor):
         )
 
 
-class ThsComputerUseExecutor(Executor):
+class ThsAppleScriptExecutor(Executor):
     def __init__(self, config: dict) -> None:
         self.config = config
         self.execution = config.get("execution", {})
@@ -486,13 +521,15 @@ class ThsComputerUseExecutor(Executor):
         self.price_tolerance = float(self.execution.get("price_tolerance", 0.001))
         self.verification_fields_path = self.execution.get("verification_fields_path", "")
         self.ths_account_mode = str(self.execution.get("ths_account_mode", "simulation"))
-        self.codex_wait_seconds = int(self.execution.get("codex_computer_use_timeout_seconds", 180))
+        self.bridge_wait_seconds = int(self.execution.get("applescript_bridge_timeout_seconds", 180))
+        self.gui_bridge_command = str(self.execution.get("gui_bridge_command", "")).strip()
+        self.order_verification_sources = self._order_verification_allowed_sources()
 
     def place_order(self, signal: OrderSignal) -> ExecutionResult:
         submitted_at = self._now()
         SCREENSHOT_DIR.mkdir(exist_ok=True)
         intent_path = self._write_intent(signal, submitted_at)
-        self._request_codex_computer_use(signal, intent_path, submit=False)
+        self._request_applescript_bridge(signal, intent_path, submit=False)
         fields = self._read_verified_fields_after(intent_path)
         screenshot_path = None
 
@@ -501,9 +538,9 @@ class ThsComputerUseExecutor(Executor):
             if not ok:
                 return ExecutionResult(
                     success=False,
-                    status="codex_computer_use_required",
+                    status="gui_bridge_required",
                     message=(
-                        f"需要使用 Codex Computer Use 完成同花顺界面填单/字段校验: {message}；"
+                        f"需要使用受控 GUI bridge 完成同花顺界面填单/字段校验: {message}；"
                         f"intent={intent_path}"
                     ),
                     submitted_at=submitted_at,
@@ -523,7 +560,7 @@ class ThsComputerUseExecutor(Executor):
 
         submitted_fields = self._read_verified_fields_after(intent_path)
         if not submitted_fields.get("submitted"):
-            self._request_codex_computer_use(signal, intent_path, submit=True)
+            self._request_applescript_bridge(signal, intent_path, submit=True)
             submitted_fields = self._read_verified_fields_after(intent_path)
         if self.require_screenshot_verification:
             ok, message = self._verify_fields(signal, submitted_fields)
@@ -539,8 +576,8 @@ class ThsComputerUseExecutor(Executor):
         if not submitted_fields.get("submitted"):
             return ExecutionResult(
                 success=False,
-                status="codex_computer_use_submit_required",
-                message="需要使用 Codex Computer Use 完成最终模拟账户提交，并写回 submitted=true，禁止记录成交。",
+                status="gui_bridge_submit_required",
+                message="需要使用受控 GUI bridge 完成最终模拟账户提交，并写回 submitted=true，禁止记录成交。",
                 submitted_at=submitted_at,
                 verified_fields=submitted_fields,
                 screenshot_path=None,
@@ -548,7 +585,7 @@ class ThsComputerUseExecutor(Executor):
         return ExecutionResult(
             success=True,
             status="submitted",
-            message="已确认 Codex Computer Use 完成同花顺最终买入/卖出按钮点击；请以同花顺委托/成交回报为准。",
+            message="已确认受控 GUI bridge 完成同花顺最终买入/卖出按钮点击；请以同花顺委托/成交回报为准。",
             submitted_at=submitted_at,
             verified_fields=submitted_fields,
             screenshot_path=None,
@@ -579,15 +616,51 @@ class ThsComputerUseExecutor(Executor):
             return None
 
     def _run_gui_bridge(self, intent_path: Path, submit: bool = False) -> Optional[Path]:
-        raise RuntimeError("已禁用后台 GUI bridge；请使用 Codex Computer Use 完成同花顺界面交互。")
+        if not self.gui_bridge_command:
+            return None
+        verification_path = self._verification_fields_path() or (SCREENSHOT_DIR / "latest_verified_order.json")
+        values = {
+            "intent_path": shlex.quote(str(intent_path)),
+            "verification_fields_path": shlex.quote(str(verification_path)),
+            "submit_flag": "--submit" if submit else "",
+            "submit": "true" if submit else "false",
+            "app_name": shlex.quote(str(self.execution.get("ths_app_name") or "同花顺")),
+            "bundle_id": shlex.quote(str(self.execution.get("ths_bundle_id") or "cn.com.10jqka.macstock")),
+            "process_name": shlex.quote(str(self.execution.get("ths_process_name") or "同花顺")),
+            "interaction_mode": shlex.quote(
+                str(self.execution.get("ths_interaction_mode") or "accessibility_first")
+            ),
+            "visual_fallback_flag": (
+                "" if bool(self.execution.get("ths_visual_fallback_enabled", True))
+                else "--no-visual-fallback"
+            ),
+        }
+        command = self.gui_bridge_command.format(**values)
+        logging.info("运行同花顺 GUI bridge: submit=%s command=%s", submit, command)
+        try:
+            result = subprocess.run(
+                command,
+                cwd=ROOT,
+                shell=True,
+                check=False,
+                capture_output=True,
+                text=True,
+                timeout=max(30, self.bridge_wait_seconds or 30),
+            )
+        except (OSError, subprocess.SubprocessError) as exc:
+            logging.warning("同花顺 GUI bridge 执行失败: %s", exc)
+            return verification_path
+        if result.returncode != 0:
+            logging.warning("同花顺 GUI bridge 未完成: %s", result.stderr.strip() or result.stdout.strip())
+        return verification_path
 
-    def _request_codex_computer_use(self, signal: OrderSignal, intent_path: Path, submit: bool = False) -> None:
+    def _request_applescript_bridge(self, signal: OrderSignal, intent_path: Path, submit: bool = False) -> None:
         verification_path = self._verification_fields_path() or (SCREENSHOT_DIR / "latest_verified_order.json")
         payload = {
             "action": "ths_order_submit" if submit else "ths_order_verify",
             "created_at": self._now(),
             "source": "trading_engine",
-            "app": "同花顺至尊版",
+            "app": str(self.execution.get("ths_app_name") or "同花顺"),
             "account_mode": self.ths_account_mode,
             "intent_path": str(intent_path),
             "verification_fields_path": str(verification_path),
@@ -595,21 +668,22 @@ class ThsComputerUseExecutor(Executor):
             "submit": submit,
             "status": "pending",
             "instruction": (
-                "请使用 Codex Computer Use 操作同花顺模拟账户界面，填入并校验订单字段；"
-                "完成后写回 verification_fields_path，source 必须为 codex_computer_use。"
+                "请使用已配置的 AppleScript GUI bridge 操作同花顺模拟账户界面，"
+                f"填入并校验订单字段；完成后写回 verification_fields_path，source 必须属于 {sorted(self.order_verification_sources)}。"
             ),
         }
-        CODEX_COMPUTER_USE_REQUEST_PATH.parent.mkdir(parents=True, exist_ok=True)
-        CODEX_COMPUTER_USE_REQUEST_PATH.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+        APPLESCRIPT_BRIDGE_REQUEST_PATH.parent.mkdir(parents=True, exist_ok=True)
+        APPLESCRIPT_BRIDGE_REQUEST_PATH.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
         logging.info(
-            "已请求 Codex Computer Use 执行同花顺%s: %s",
+            "已请求同花顺 GUI 执行%s: %s",
             "最终提交" if submit else "填单校验",
-            CODEX_COMPUTER_USE_REQUEST_PATH,
+            APPLESCRIPT_BRIDGE_REQUEST_PATH,
         )
+        self._run_gui_bridge(intent_path, submit=submit)
         self._wait_for_codex_verification(intent_path, submit=submit)
 
     def _wait_for_codex_verification(self, intent_path: Path, submit: bool = False) -> None:
-        deadline = time.monotonic() + max(0, self.codex_wait_seconds)
+        deadline = time.monotonic() + max(0, self.bridge_wait_seconds)
         while time.monotonic() <= deadline:
             fields = self._read_verified_fields_after(intent_path)
             if fields and (not submit or fields.get("submitted")):
@@ -654,11 +728,18 @@ class ThsComputerUseExecutor(Executor):
     def _verify_fields(self, signal: OrderSignal, fields: dict) -> tuple[bool, str]:
         if not fields:
             return False, "未读取到 OCR/视觉校验字段。"
+        validation_errors = fields.get("validation_errors")
+        if validation_errors:
+            if isinstance(validation_errors, list):
+                detail = ", ".join(str(error) for error in validation_errors)
+            else:
+                detail = str(validation_errors)
+            return False, f"GUI bridge 校验失败: {detail}"
         if str(fields.get("symbol", "")) != signal.symbol:
             return False, f"代码不匹配: {fields.get('symbol')}"
         if str(fields.get("side", "")).upper() != signal.side:
             return False, f"方向不匹配: {fields.get('side')}"
-        if str(fields.get("source", "")).strip() != "codex_computer_use":
+        if str(fields.get("source", "")).strip() not in self.order_verification_sources:
             return False, f"校验来源不匹配: {fields.get('source')}"
         account_mode = self._normalize_account_mode(fields.get("account_mode") or fields.get("trade_mode"))
         if account_mode != self.ths_account_mode:
@@ -670,10 +751,24 @@ class ThsComputerUseExecutor(Executor):
             return False, "数量或价格字段无法解析。"
         if quantity != signal.quantity:
             return False, f"数量不匹配: {quantity}"
+        if signal.side == "SELL":
+            try:
+                sellable_quantity = int(fields.get("sellable_quantity"))
+            except (TypeError, ValueError):
+                return False, "卖出订单未提供可解析的可卖数量。"
+            if signal.quantity > sellable_quantity:
+                return False, f"卖出数量 {signal.quantity} 超过界面可卖数量 {sellable_quantity}。"
         expected_price = float(signal.limit_price or 0.0)
         if abs(price - expected_price) > self.price_tolerance:
             return False, f"价格不匹配: {price} != {expected_price}"
         return True, "校验通过。"
+
+    def _order_verification_allowed_sources(self) -> set[str]:
+        raw_sources = self.execution.get("order_verification_allowed_sources", ["applescript_vision_ocr"])
+        if isinstance(raw_sources, str):
+            raw_sources = [raw_sources]
+        sources = {str(source).strip() for source in raw_sources if str(source).strip()}
+        return sources or {"applescript_vision_ocr"}
 
     @staticmethod
     def _normalize_account_mode(value: object) -> str:
@@ -691,8 +786,8 @@ def build_executor(config: dict) -> Executor:
         return DryRunExecutor()
     if mode == "manual_confirm":
         return ManualConfirmExecutor()
-    if mode == "ths_computer_use":
-        return ThsComputerUseExecutor(config)
+    if mode == "ths_applescript":
+        return ThsAppleScriptExecutor(config)
     raise RuntimeError(f"未知执行模式: {mode}")
 
 
@@ -715,7 +810,7 @@ def sync_portfolio_from_account(
     max_age_seconds = int(execution.get("account_snapshot_max_age_seconds", 300))
     allowed_sources = account_snapshot_allowed_sources(execution)
     if command_template:
-        return False, "后台账户桥接命令已禁用；请使用 Codex Computer Use 写入同花顺账户快照。"
+        return False, "后台账户桥接命令已禁用；请使用内置 AppleScript + Apple Vision OCR 账户桥。"
 
     min_mtime = time.time() if force_refresh else None
     snapshot = None if force_refresh else load_recent_account_snapshot(
@@ -725,17 +820,17 @@ def sync_portfolio_from_account(
         allowed_sources=allowed_sources,
     )
     if snapshot is None:
-        request_codex_account_snapshot(
+        request_applescript_account_snapshot(
             snapshot_path,
             account_mode,
-            int(execution.get("codex_computer_use_timeout_seconds", 180)),
+            int(execution.get("applescript_bridge_timeout_seconds", 180)),
             reason=reason,
             min_mtime=min_mtime,
             allowed_sources=allowed_sources,
             symbol=str(config["symbols"][0]),
-            app_name=str(execution.get("ths_app_name") or "同花顺至尊版"),
-            bundle_id=str(execution.get("ths_bundle_id") or "cn.com.10jqka.iHexinFee"),
-            process_name=str(execution.get("ths_process_name") or "EQHexinFee"),
+            app_name=str(execution.get("ths_app_name") or "同花顺"),
+            bundle_id=str(execution.get("ths_bundle_id") or "cn.com.10jqka.macstock"),
+            process_name=str(execution.get("ths_process_name") or "同花顺"),
         )
         snapshot = load_recent_account_snapshot(
             snapshot_path,
@@ -747,9 +842,9 @@ def sync_portfolio_from_account(
     if snapshot is None:
         return (
             False,
-            "Codex Computer Use 账户快照不存在、过期或无效: "
-            f"{snapshot_path}；已写入待处理请求: {CODEX_COMPUTER_USE_REQUEST_PATH}。"
-            "请在 Codex 会话中处理该请求并写回快照，或先用已有新快照重新运行。",
+            "同花顺账户快照不存在、过期或无效: "
+            f"{snapshot_path}；允许来源: {sorted(allowed_sources)}。"
+            "请检查已配置的账户桥接或先用已有新快照重新运行。",
         )
     logging.info(
         "使用同花顺账户快照: source=%s path=%s age=%ss",
@@ -777,14 +872,14 @@ def sync_portfolio_from_account(
 
 
 def account_snapshot_allowed_sources(execution: dict) -> set[str]:
-    raw_sources = execution.get("account_snapshot_allowed_sources", ["codex_computer_use"])
+    raw_sources = execution.get("account_snapshot_allowed_sources", ["apple_vision_ocr"])
     if isinstance(raw_sources, str):
         raw_sources = [raw_sources]
     sources = {str(source).strip() for source in raw_sources if str(source).strip()}
-    return sources or {"codex_computer_use"}
+    return sources or {"apple_vision_ocr"}
 
 
-def request_codex_account_snapshot(
+def request_applescript_account_snapshot(
     snapshot_path: Path,
     account_mode: str,
     wait_seconds: int,
@@ -793,29 +888,36 @@ def request_codex_account_snapshot(
     min_mtime: Optional[float] = None,
     allowed_sources: Optional[set[str]] = None,
     symbol: str = "588330",
-    app_name: str = "同花顺至尊版",
-    bundle_id: str = "cn.com.10jqka.iHexinFee",
-    process_name: str = "EQHexinFee",
+    app_name: str = "同花顺",
+    bundle_id: str = "cn.com.10jqka.macstock",
+    process_name: str = "同花顺",
 ) -> None:
-    allowed_sources = allowed_sources or {"codex_computer_use"}
-    payload = {
-        "action": "ths_account_snapshot",
-        "created_at": datetime.now().isoformat(timespec="seconds"),
-        "source": "trading_engine",
-        "reason": reason,
-        "app": "同花顺至尊版",
-        "account_mode": account_mode,
-        "account_snapshot_path": str(snapshot_path),
-        "status": "pending",
-        "instruction": (
-            "请使用 Codex Computer Use 读取同花顺模拟账户资金和持仓，写回 account_snapshot_path；"
-            f"source 必须属于 {sorted(allowed_sources)}。"
-        ),
-        "allowed_sources": sorted(allowed_sources),
-    }
-    CODEX_COMPUTER_USE_REQUEST_PATH.parent.mkdir(parents=True, exist_ok=True)
-    CODEX_COMPUTER_USE_REQUEST_PATH.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
-    logging.info("已请求 Codex Computer Use 同步同花顺账户快照: %s", CODEX_COMPUTER_USE_REQUEST_PATH)
+    allowed_sources = allowed_sources or {"apple_vision_ocr"}
+    bridge_request_enabled = "applescript_bridge" in allowed_sources
+    if bridge_request_enabled:
+        payload = {
+            "action": "ths_account_snapshot",
+            "created_at": datetime.now().isoformat(timespec="seconds"),
+            "source": "trading_engine",
+            "reason": reason,
+            "app": app_name,
+            "account_mode": account_mode,
+            "account_snapshot_path": str(snapshot_path),
+            "status": "pending",
+            "instruction": (
+                "请使用 AppleScript 账户桥读取同花顺模拟账户资金和持仓，写回 account_snapshot_path；"
+                f"source 必须属于 {sorted(allowed_sources)}。"
+            ),
+            "allowed_sources": sorted(allowed_sources),
+        }
+        APPLESCRIPT_BRIDGE_REQUEST_PATH.parent.mkdir(parents=True, exist_ok=True)
+        APPLESCRIPT_BRIDGE_REQUEST_PATH.write_text(
+            json.dumps(payload, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+        logging.info("已请求 AppleScript bridge 同步同花顺账户快照: %s", APPLESCRIPT_BRIDGE_REQUEST_PATH)
+    else:
+        logging.info("使用 AppleScript + Apple Vision OCR 同步同花顺账户快照: %s", snapshot_path)
     deadline = time.monotonic() + max(0, wait_seconds)
     next_log_at = time.monotonic() + 30
     next_apple_bridge_at = time.monotonic() if "apple_vision_ocr" in allowed_sources else None
@@ -837,26 +939,32 @@ def request_codex_account_snapshot(
             allowed_sources=allowed_sources,
         )
         if snapshot is not None:
-            mark_codex_request_status("completed", "账户快照已写回。")
+            if bridge_request_enabled:
+                mark_applescript_request_status("completed", "账户快照已写回。")
             return
         if stop_requested():
-            mark_codex_request_status("stopped", "检测到停止文件，停止等待账户快照。")
+            if bridge_request_enabled:
+                mark_applescript_request_status("stopped", "检测到停止文件，停止等待账户快照。")
             return
         if time.monotonic() >= next_log_at:
-            logging.info("仍在等待 Codex Computer Use 写回账户快照: %s", snapshot_path)
+            if bridge_request_enabled:
+                logging.info("仍在等待 AppleScript bridge 写回账户快照: %s", snapshot_path)
+            else:
+                logging.info("仍在等待 AppleScript + Apple Vision OCR 生成账户快照: %s", snapshot_path)
             next_log_at = time.monotonic() + 30
         time.sleep(1)
-    mark_codex_request_status("timed_out", f"{wait_seconds}s 内未收到 Codex Computer Use 账户快照。")
+    if bridge_request_enabled:
+        mark_applescript_request_status("timed_out", f"{wait_seconds}s 内未收到 AppleScript bridge 账户快照。")
 
 
 def run_apple_app_bridge_navigation(
     symbol: str,
     *,
-    app_name: str = "同花顺至尊版",
-    bundle_id: str = "cn.com.10jqka.iHexinFee",
-    process_name: str = "EQHexinFee",
+    app_name: str = "同花顺",
+    bundle_id: str = "cn.com.10jqka.macstock",
+    process_name: str = "同花顺",
 ) -> bool:
-    script_path = ROOT / "App_Bridge_AppleScript.py"
+    script_path = ROOT / "AppBridge_AppleScript.py"
     if not script_path.exists():
         logging.warning("AppleScript App bridge 脚本不存在: %s", script_path)
         return False
@@ -897,9 +1005,9 @@ def run_apple_account_snapshot_bridge(
     snapshot_path: Path,
     *,
     symbol: str = "588330",
-    app_name: str = "同花顺至尊版",
-    bundle_id: str = "cn.com.10jqka.iHexinFee",
-    process_name: str = "EQHexinFee",
+    app_name: str = "同花顺",
+    bundle_id: str = "cn.com.10jqka.macstock",
+    process_name: str = "同花顺",
 ) -> None:
     if not run_apple_app_bridge_navigation(
         symbol,
@@ -950,18 +1058,18 @@ def run_apple_account_snapshot_bridge(
     logging.info("Apple Vision OCR 账户快照桥已写回: %s", snapshot_path)
 
 
-def mark_codex_request_status(status: str, message: str) -> None:
+def mark_applescript_request_status(status: str, message: str) -> None:
     try:
-        payload = json.loads(CODEX_COMPUTER_USE_REQUEST_PATH.read_text(encoding="utf-8"))
+        payload = json.loads(APPLESCRIPT_BRIDGE_REQUEST_PATH.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
         return
     payload["status"] = status
     payload["updated_at"] = datetime.now().isoformat(timespec="seconds")
     payload["message"] = message
     try:
-        CODEX_COMPUTER_USE_REQUEST_PATH.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+        APPLESCRIPT_BRIDGE_REQUEST_PATH.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
     except OSError:
-        logging.warning("更新 Codex Computer Use 请求状态失败: %s", CODEX_COMPUTER_USE_REQUEST_PATH)
+        logging.warning("更新 AppleScript bridge 请求状态失败: %s", APPLESCRIPT_BRIDGE_REQUEST_PATH)
 
 
 def load_recent_account_snapshot(
@@ -985,7 +1093,7 @@ def load_recent_account_snapshot(
         return None
     if snapshot.get("account_mode") != account_mode:
         return None
-    allowed_sources = allowed_sources or {"codex_computer_use"}
+    allowed_sources = allowed_sources or {"apple_vision_ocr"}
     if snapshot.get("source") not in allowed_sources:
         return None
     if snapshot.get("validation_errors"):
@@ -1123,6 +1231,84 @@ def setup_logging() -> None:
     root_logger.addHandler(stream_handler)
 
 
+def screenshot_cleanup_config(config: dict) -> dict:
+    runtime = config.get("runtime", {})
+    cleanup = runtime.get("screenshots_cleanup", config.get("screenshots_cleanup", {}))
+    if not isinstance(cleanup, dict):
+        cleanup = {}
+    merged = dict(SCREENSHOT_CLEANUP_DEFAULTS)
+    merged.update(cleanup)
+    merged["enabled"] = bool(merged.get("enabled", True))
+    merged["retention_days"] = max(0, int(merged.get("retention_days", 7)))
+    merged["max_files"] = max(0, int(merged.get("max_files", 300)))
+    merged["keep_latest_files"] = bool(merged.get("keep_latest_files", True))
+    return merged
+
+
+def is_protected_screenshot_artifact(path: Path, cleanup: dict) -> bool:
+    if not cleanup.get("keep_latest_files", True):
+        return False
+    return path.name.startswith("latest_")
+
+
+def cleanup_screenshots(config: dict, *, force: bool = False, now: Optional[float] = None) -> ScreenshotCleanupResult:
+    cleanup = screenshot_cleanup_config(config)
+    retention_days = int(cleanup["retention_days"])
+    max_files = int(cleanup["max_files"])
+    if not force and not cleanup["enabled"]:
+        return ScreenshotCleanupResult(0, 0, 0, 0, retention_days, max_files)
+    if not SCREENSHOT_DIR.exists():
+        return ScreenshotCleanupResult(0, 0, 0, 0, retention_days, max_files)
+
+    now = time.time() if now is None else now
+    cutoff = now - retention_days * 86400
+    artifacts = [
+        path
+        for path in SCREENSHOT_DIR.iterdir()
+        if path.is_file() and path.suffix.lower() in SCREENSHOT_CLEANUP_SUFFIXES
+    ]
+    protected = [path for path in artifacts if is_protected_screenshot_artifact(path, cleanup)]
+    eligible = [path for path in artifacts if path not in protected]
+    to_delete: set[Path] = set()
+    if retention_days > 0:
+        to_delete.update(path for path in eligible if path.stat().st_mtime < cutoff)
+    if max_files > 0:
+        survivors = [path for path in eligible if path not in to_delete]
+        overflow = len(survivors) - max_files
+        if overflow > 0:
+            survivors.sort(key=lambda path: path.stat().st_mtime)
+            to_delete.update(survivors[:overflow])
+
+    deleted = 0
+    for path in sorted(to_delete):
+        try:
+            path.unlink()
+            deleted += 1
+        except OSError as exc:
+            logging.warning("清理截图文件失败: %s error=%s", path, exc)
+
+    kept = len(artifacts) - deleted
+    result = ScreenshotCleanupResult(
+        scanned=len(artifacts),
+        deleted=deleted,
+        kept=kept,
+        retained_latest=len(protected),
+        retention_days=retention_days,
+        max_files=max_files,
+    )
+    if deleted:
+        logging.info(
+            "screenshots 自动清理完成: scanned=%s deleted=%s kept=%s latest_kept=%s retention_days=%s max_files=%s",
+            result.scanned,
+            result.deleted,
+            result.kept,
+            result.retained_latest,
+            result.retention_days,
+            result.max_files,
+        )
+    return result
+
+
 def signal_condition_text(signal: Optional[OrderSignal]) -> str:
     if not signal:
         return "未满足买入/卖出条件"
@@ -1224,12 +1410,12 @@ def latest_log_lines(path: Path = LOG_PATH, limit: int = 8) -> list[str]:
 
 def open_live_log_window(path: Path = LOG_PATH) -> bool:
     path.touch(exist_ok=True)
-    logging.info("按 Codex Computer Use 优先原则，不自动操作 Terminal。实时日志命令: tail -f %s", path)
+    logging.info("不自动操作 Terminal。实时日志命令: tail -f %s", path)
     return False
 
 
 def open_trading_app(execution: dict) -> bool:
-    app_name = str(execution.get("ths_app_name") or "同花顺至尊版").strip()
+    app_name = str(execution.get("ths_app_name") or "同花顺").strip()
     if not app_name:
         return False
     try:
@@ -1386,7 +1572,7 @@ def run_once(
     executor = build_executor(config)
 
     for symbol in config["symbols"]:
-        if portfolio.traded_today(symbol, today):
+        if portfolio.traded_today(symbol, today) and not risk_manager.allows_repeated_symbol_trades():
             logging.info("%s 今日已执行过交易，跳过。", symbol)
             continue
 
@@ -1501,6 +1687,7 @@ def main() -> None:
     parser.add_argument("--stop", action="store_true", help="写入 STOP_TRADING，让持续运行的交易引擎尽快退出")
     parser.add_argument("--clear-stop", action="store_true", help="清除 STOP_TRADING，允许交易引擎再次运行")
     parser.add_argument("--open-log", action="store_true", help="持续运行时额外打开实时日志窗口")
+    parser.add_argument("--cleanup-screenshots", action="store_true", help="按配置立即清理 screenshots 历史截图和诊断 JSON")
     args = parser.parse_args()
 
     setup_logging()
@@ -1523,6 +1710,14 @@ def main() -> None:
 
     config = load_config()
     execution = config.get("execution", {})
+    if args.cleanup_screenshots:
+        result = cleanup_screenshots(config, force=True)
+        print(
+            "screenshots 清理完成: "
+            f"扫描 {result.scanned}，删除 {result.deleted}，保留 {result.kept}，"
+            f"保留 latest_* {result.retained_latest}。"
+        )
+        return
     logging.info(
         "启动交易机器人，股票代码: %s，执行模式=%s，执行阶段=%s",
         ",".join(config["symbols"]),
@@ -1536,9 +1731,10 @@ def main() -> None:
         print("配置检查通过")
         return
 
+    cleanup_screenshots(config)
     Notifier(config).notify("AI Stock 启动", f"执行模式={execution.get('mode', 'dry_run')} 执行阶段={execution.get('stage', 'dry_run')}")
     account_synced_after_app_open = False
-    if execution.get("mode") == "ths_computer_use":
+    if execution.get("mode") == "ths_applescript":
         open_trading_app(execution)
         account_synced_after_app_open = sync_account_after_app_open(config)
         if not account_synced_after_app_open:

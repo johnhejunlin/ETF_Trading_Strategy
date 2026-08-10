@@ -1,6 +1,6 @@
 # AI Stock 自动化交易骨架
 
-这是一个面向同花顺桌面 App 的自动化交易骨架。当前默认进入 `sim_run` 阶段，使用同花顺至尊版模拟账户完成模拟交易；真实账户仍被禁用。
+这是一个面向同花顺桌面 App 的自动化交易骨架。当前默认进入 `sim_run` 阶段，使用同花顺模拟账户完成模拟交易；真实账户仍被禁用。
 
 ## 当前配置
 
@@ -10,8 +10,8 @@
   - 下午 `13:00-15:15`
 - 默认执行：
   - `execution.stage`: `sim_run`
-  - `execution.mode`: `ths_computer_use`
-  - 进入同花顺至尊版模拟账户，先同步资金/持仓，字段和截图校验通过后提交模拟买卖单
+  - `execution.mode`: `ths_applescript`
+  - 进入同花顺模拟账户，先同步资金/持仓，字段和截图校验通过后提交模拟买卖单
 - 监控频率：`poll_seconds=60`，每 1 分钟获取一次行情并检查策略
 - 初始资金：`50000`
 - 买入策略：
@@ -39,7 +39,7 @@
 - 执行层：
   - `DryRunExecutor`：只记录模拟订单
   - `ManualConfirmExecutor`：人工确认占位，尚不提交真实订单
-  - `ThsComputerUseExecutor`：同花顺安全执行框架，要求截图/字段校验；真实最终确认默认关闭
+  - `ThsAppleScriptExecutor`：同花顺安全执行框架，优先使用 macOS Accessibility，且始终要求截图/OCR 字段校验
 - 行情层：
   - `market_data.py`：负责实时行情和日 K 数据
   - `trading_engine.py` 持续运行时会先记录目标标的实时行情，再调用策略判断
@@ -88,9 +88,11 @@ python3 trading_engine.py --open-log
 python3 trading_engine.py --status
 python3 trading_engine.py --stop
 python3 trading_engine.py --clear-stop
+python3 trading_engine.py --cleanup-screenshots
 ```
 
 `--stop` 会写入 `STOP_TRADING`，持续运行中的交易引擎会在睡眠期间每秒检查一次并尽快退出；下次重新运行前先执行 `--clear-stop`。
+`--cleanup-screenshots` 会按 `runtime.screenshots_cleanup` 配置立即清理 `screenshots/` 中的历史 `.png/.json` 文件；交易引擎正常启动时也会自动执行一次清理。
 
 检查配置：
 
@@ -113,7 +115,7 @@ python3 -m unittest discover -s tests
 3. `market_data.py` 获取目标股票实时行情和日 K 数据。
 4. `trading_strategy.py` 根据行情、均线、持仓和最新买入价生成买卖信号。
 5. `trading_engine.py` 的风控模块检查白名单、交易时段、交易日、仓位、金额和停止文件。
-6. 执行器根据 `execution.mode` 和 `execution.stage` 处理信号；当前默认 `sim_run` 会在同花顺至尊版模拟账户提交订单。
+6. 执行器根据 `execution.mode` 和 `execution.stage` 处理信号；当前默认 `sim_run` 会在同花顺模拟账户提交订单。
 7. 结果写入日志、`portfolio.json`、`signals.csv` 和 `runtime_state.json`。
 
 文件职责：
@@ -175,7 +177,7 @@ launchctl remove com.aistock.tradingengine
 
 - `dry_run`：只能使用 `execution.mode=dry_run`。
 - `gui_simulation`：生成订单意图后等待受控 GUI 自动化完成同花顺界面填单和字段校验；`final_confirm_enabled=false` 时不会最终提交。
-- `sim_run`：使用同花顺至尊版模拟账户执行买入/卖出；必须保持 `execution.ths_account_mode=simulation`，并通过截图/OCR/字段校验。
+- `sim_run`：使用同花顺模拟账户执行买入/卖出；必须保持 `execution.ths_account_mode=simulation`，并通过截图/OCR/字段校验。
 - `small_live`：预留小资金实盘阶段，默认买入金额上限 `5000`。
 - `full_live`：预留完整额度阶段，默认买入金额上限 `50000`。
 
@@ -183,13 +185,37 @@ launchctl remove com.aistock.tradingengine
 
 - `dry_run`：只记录计划动作，不触碰同花顺。
 - `manual_confirm`：人工确认占位，当前不会提交真实订单。
-- `ths_computer_use`：同花顺 GUI 协作执行器。后台进程生成订单意图并读取校验文件；真实 App UI 操作可由 Codex Computer Use、AppleScript bridge 或其他受控本机自动化完成。当前默认只允许模拟账户交易，实盘账户仍被阻断。
+- `ths_applescript`：同花顺 AppleScript 执行器。后台进程生成订单意图，由项目内 AppleScript + Accessibility bridge 操作 App，并使用 Apple Vision OCR 独立校验。当前默认只允许模拟账户交易，实盘账户仍被阻断。
 
 同花顺 Mac 版交易界面必须先使用 App 内的“模拟”交易选项完成调试。`execution.ths_account_mode` 默认是 `simulation`，`execution.live_account_enabled=false`；在这个状态下，如果 GUI 校验识别到实盘/普通交易界面，系统会阻断执行。
 
-`execution.gui_bridge_command` 和 `execution.account_bridge_command` 可用于后续接入受控 GUI bridge，但默认仍建议留空，由人工、Codex Computer Use 或 AppleScript bridge 按需处理。交易引擎会写出 `screenshots/latest_order_intent.json`，然后等待并读取 `screenshots/latest_verified_order.json`；桥接实现必须写入账户模式、订单字段、提交状态、截图路径和可复盘日志。
+同花顺 App 交互采用以下分层：
 
-`gui_simulation` 阶段只要求完成填单并写回 `submitted=false` 的校验文件。`sim_run` 阶段在字段校验通过且 `execution.final_confirm_enabled=true` 后，可由受控 GUI 自动化点击最终的“买入(模拟账户)”或“卖出(模拟账户)”按钮，并写回 `submitted=true`；后台引擎只认校验文件和截图凭证，不假设具体由哪种工具点击。`execution.codex_computer_use_timeout_seconds` 控制引擎等待回写结果的最长时间。
+1. `macOS Accessibility` 是常规交互主路径。按钮通过名称和 `AXPress` 操作；代码、价格、数量通过附近语义标签定位文本框，设置 `AXValue` 后立即回读。禁止依赖 `child[n]` 之类会随界面变化的控件序号。
+2. 截图和 Apple Vision OCR 是独立的安全复核层。即使 Accessibility 写入和回读成功，也必须再次验证模拟账户、方向、代码、价格、数量和确认/回执页面，并保留截图凭证。
+3. OCR 坐标与 `AppBridge_UIMap.py` 只作为 Accessibility 无法识别自绘控件、WebView 或特殊弹窗时的受控兜底。UI Map 不参与常规导航或填单。
+
+相关配置：
+
+- `execution.ths_interaction_mode=accessibility_first`：先使用 Accessibility。
+- `execution.ths_visual_fallback_enabled=false`：普通版当前默认关闭坐标兜底，Accessibility 失败时直接安全停止。只有完成普通版页面坐标校准和安全点击验证后才应改为 `true`。
+- `execution.require_screenshot_verification=true`：必须保持开启，不因 Accessibility 可用而跳过视觉复核。
+
+`execution.gui_bridge_command` 配置订单 AppleScript bridge；账户同步默认使用项目内置的 AppleScript + Apple Vision OCR bridge。交易引擎会写出 `screenshots/latest_order_intent.json`，然后等待并读取 `screenshots/latest_verified_order.json`；桥接实现必须写入账户模式、订单字段、提交状态、截图路径和可复盘日志。没有特殊要求时不使用 Computer Use 操作同花顺。
+
+`gui_simulation` 阶段只要求完成填单并写回 `submitted=false` 的校验文件。`sim_run` 阶段在字段校验通过且 `execution.final_confirm_enabled=true` 后，可由受控 GUI 自动化点击最终的“买入(模拟账户)”或“卖出(模拟账户)”按钮，并写回 `submitted=true`；后台引擎只认校验文件和截图凭证，不假设具体由哪种工具点击。`execution.applescript_bridge_timeout_seconds` 控制引擎等待回写结果的最长时间。
+
+当前 AppleScript GUI bridge 已接入模拟账户买入和卖出路径，默认 `execution.gui_bridge_command` 会根据订单 intent 自动选择方向，并以 Accessibility 为主路径：
+
+```bash
+python3 AppBridge_AppleScript.py --action order --intent screenshots/latest_order_intent.json --verification screenshots/latest_verified_order.json
+```
+
+第一次调用使用 Accessibility 填入对应的模拟买入/卖出表单，逐字段回读后停在委托确认弹窗，再由 OCR 独立校验方向、代码、数量和价格并写回 `submitted=false`；卖出还会在打开确认弹窗前校验界面的可卖数量。当交易引擎在 `sim_run` 且 `final_confirm_enabled=true` 时，第二次调用会复用字段完全匹配的确认弹窗，优先通过 `AXPress` 点击“确认买入”或“确认卖出”，识别“委托已提交/委托成功/合同号”回执后写回 `submitted=true`。
+
+`AppBridge_UIMap.py` 保留用于采集、诊断和校准 Accessibility 未暴露的界面区域。它不会被交易引擎的正常订单流程自动调用；需要视觉兜底时，应先用安全页面验证坐标转换和目标页面，再允许桥接脚本使用该路径。
+
+模拟账户可通过 `execution.simulation_allow_repeated_symbol_trades=true` 允许同一标的一日内正常多次买卖，但仍受 `risk.max_orders_per_day` 的每日总次数上限约束。实盘账户不使用该放宽规则。
 
 不要把交易密码写入 `config.json`、脚本或任何会提交到 GitHub 的文件。需要输入交易密码时，只能通过受控交互按需输入，不写入仓库。
 
@@ -203,7 +229,7 @@ launchctl remove com.aistock.tradingengine
   "cash_balance": 20000.0,
   "market_value": 30123.45,
   "profit_loss": -88.5,
-  "source": "codex_computer_use",
+  "source": "apple_vision_ocr",
   "submitted": false
 }
 ```
@@ -211,16 +237,18 @@ launchctl remove com.aistock.tradingengine
 也可以使用 Apple 原生只读快照桥进行模拟账户诊断：
 
 ```bash
-python3 App_Bridge_AppleScript.py
+python3 AppBridge_AppleScript.py
 python3 apple_account_snapshot.py
 python3 apple_account_snapshot.py --write-latest
 ```
 
-`App_Bridge_AppleScript.py` 会打开同花顺并导航到 App 内“模拟交易”的持仓页，写出 `screenshots/latest_applescript_bridge_holdings.json` 作为导航校验凭证；它不会填单或提交订单。`apple_account_snapshot.py` 会通过 CoreGraphics 查找同花顺窗口，使用 `screencapture` 截指定窗口，再用 Apple Vision OCR 读取账户页。默认只写 `screenshots/apple_account_snapshot_*.json` 和 `screenshots/latest_account_ocr.json` 诊断文件；只有 `--write-latest` 才会写入 `screenshots/latest_account_snapshot.json`。交易引擎在 `execution.account_snapshot_allowed_sources` 显式包含 `apple_vision_ocr` 时，会先运行 `App_Bridge_AppleScript.py` 校验模拟持仓页，再运行 `apple_account_snapshot.py` 生成标准账户快照；快照没有 `warnings` / `validation_errors` 时才会接受。
+`AppBridge_AppleScript.py` 会打开同花顺并导航到 App 内“模拟交易”的持仓页，写出 `screenshots/latest_applescript_bridge_holdings.json` 作为导航校验凭证；它不会填单或提交订单。`apple_account_snapshot.py` 会通过 CoreGraphics 查找同花顺窗口，使用 `screencapture` 截指定窗口，再用 Apple Vision OCR 读取账户页。默认只写 `screenshots/apple_account_snapshot_*.json` 和 `screenshots/latest_account_ocr.json` 诊断文件；只有 `--write-latest` 才会写入 `screenshots/latest_account_snapshot.json`。交易引擎在 `execution.account_snapshot_allowed_sources` 显式包含 `apple_vision_ocr` 时，会先运行 `AppBridge_AppleScript.py` 校验模拟持仓页，再运行 `apple_account_snapshot.py` 生成标准账户快照；快照没有 `warnings` / `validation_errors` 时才会接受。
 
-`trading_engine.py` 打开同花顺 App 后会优先复用未过期且来源属于 `execution.account_snapshot_allowed_sources` 的账户快照，并把 `portfolio.json` 的可用金额、总资产和目标标的持仓同步到该快照；持续轮询行情和策略时不会重复做账户验证。`execution.force_account_sync_on_app_open=true` 时，启动后会强制要求重新读取账户。无论启动时是否复用快照，真正下单前、下单后仍会强制重新读取账户。
+`screenshots/` 自动清理策略在 `config.json` 的 `runtime.screenshots_cleanup` 中配置。默认启动时清理超过 7 天的历史截图/诊断 JSON，并在历史文件超过 300 个时优先删除最旧文件；`latest_*` 当前状态文件默认保留，避免误删正在被交易引擎读取的订单意图、校验结果或账户快照。
 
-如果快照不存在、过期、无效或账户模式不是 `simulation`，引擎会写出账户同步请求到 `screenshots/latest_codex_computer_use_request.json` 并等待受控 GUI 自动化回写结果，超时后把请求状态标记为 `timed_out` 并停止本次运行，避免用过期的本地资金/持仓继续判断交易。
+`trading_engine.py` 每次打开同花顺 App 后，都会先进入“交易 → 模拟 → 持仓”并重新读取账户快照，再同步 `portfolio.json` 的可用金额、总资产和目标标的持仓；导航或快照校验失败时会停止启动，不会进入策略轮询。持续轮询行情和策略时不会重复做账户验证。真正下单前、下单后仍会再次强制重新读取账户。
+
+如果快照不存在、过期、无效或账户模式不是 `simulation`，引擎会调用内置 AppleScript + Apple Vision OCR bridge 重新生成账户快照并等待校验结果；超时后停止本次运行，避免用过期的本地资金/持仓继续判断交易。
 
 这里的资金口径必须区分：
 

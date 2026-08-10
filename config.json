@@ -11,20 +11,23 @@
     "initial_cash": 50000
   },
   "risk": {
-    "max_orders_per_day": 1,
+    "max_orders_per_day": 10,
     "require_manual_confirm": true,
     "allowed_symbols": ["588330"]
   },
   "execution": {
-    "mode": "ths_computer_use",
+    "mode": "ths_applescript",
     "stage": "sim_run",
     "ths_account_mode": "simulation",
     "live_account_enabled": false,
+    "simulation_allow_repeated_symbol_trades": true,
     "max_live_cash": 50000,
     "small_live_cash": 5000,
-    "ths_app_name": "同花顺至尊版",
-    "ths_bundle_id": "cn.com.10jqka.iHexinFee",
-    "ths_process_name": "EQHexinFee",
+    "ths_app_name": "同花顺",
+    "ths_bundle_id": "cn.com.10jqka.macstock",
+    "ths_process_name": "同花顺",
+    "ths_interaction_mode": "accessibility_first",
+    "ths_visual_fallback_enabled": false,
     "trade_password_env": "THS_TRADE_PASSWORD",
     "stage_cash_limits": {
       "dry_run": 50000,
@@ -37,13 +40,14 @@
     "final_confirm_enabled": true,
     "price_tolerance": 0.001,
     "verification_fields_path": "screenshots/latest_verified_order.json",
+    "order_verification_allowed_sources": ["applescript_vision_ocr"],
     "account_snapshot_path": "screenshots/latest_account_snapshot.json",
     "account_snapshot_max_age_seconds": 3600,
-    "account_snapshot_allowed_sources": ["codex_computer_use", "apple_vision_ocr"],
-    "force_account_sync_on_app_open": false,
-    "codex_computer_use_timeout_seconds": 180,
+    "account_snapshot_allowed_sources": ["apple_vision_ocr"],
+    "force_account_sync_on_app_open": true,
+    "applescript_bridge_timeout_seconds": 180,
     "account_bridge_command": "",
-    "gui_bridge_command": ""
+    "gui_bridge_command": "python3 AppBridge_AppleScript.py --action order --app-name {app_name} --bundle-id {bundle_id} --process-name {process_name} --interaction-mode {interaction_mode} {visual_fallback_flag} --intent {intent_path} --verification {verification_fields_path} {submit_flag}"
   },
   "notification": {
     "channel": "wechat_client",
@@ -52,7 +56,13 @@
   "runtime": {
     "trade_day_schedule_enabled": true,
     "stop_file": "STOP_TRADING",
-    "state_file": "runtime_state.json"
+    "state_file": "runtime_state.json",
+    "screenshots_cleanup": {
+      "enabled": true,
+      "retention_days": 7,
+      "max_files": 300,
+      "keep_latest_files": true
+    }
   },
   "backtest": {
     "commission_rate": 0.0003,

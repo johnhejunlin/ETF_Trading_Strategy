@@ -1,4 +1,5 @@
 import json
+import os
 import tempfile
 import time
 import unittest
@@ -44,9 +45,11 @@ def base_config() -> dict:
             "live_account_enabled": False,
             "max_live_cash": 50000,
             "small_live_cash": 5000,
-            "ths_app_name": "同花顺至尊版",
-            "ths_bundle_id": "cn.com.10jqka.iHexinFee",
-            "ths_process_name": "EQHexinFee",
+            "ths_app_name": "同花顺",
+            "ths_bundle_id": "cn.com.10jqka.macstock",
+            "ths_process_name": "同花顺",
+            "ths_interaction_mode": "accessibility_first",
+            "ths_visual_fallback_enabled": True,
             "trade_password_env": "THS_TRADE_PASSWORD",
             "stage_cash_limits": {
                 "dry_run": 50000,
@@ -59,13 +62,22 @@ def base_config() -> dict:
             "final_confirm_enabled": False,
             "price_tolerance": 0.001,
             "verification_fields_path": "",
+            "order_verification_allowed_sources": ["applescript_bridge"],
             "account_snapshot_path": "",
-            "account_snapshot_allowed_sources": ["codex_computer_use"],
-            "codex_computer_use_timeout_seconds": 0,
+            "account_snapshot_allowed_sources": ["applescript_bridge"],
+            "applescript_bridge_timeout_seconds": 0,
             "account_bridge_command": "",
             "gui_bridge_command": "",
         },
-        "runtime": {"trade_day_schedule_enabled": True},
+        "runtime": {
+            "trade_day_schedule_enabled": True,
+            "screenshots_cleanup": {
+                "enabled": True,
+                "retention_days": 7,
+                "max_files": 300,
+                "keep_latest_files": True,
+            },
+        },
     }
 
 
@@ -104,7 +116,7 @@ class TradingEngineSafetyTests(unittest.TestCase):
 
     def test_risk_blocks_small_live_order_over_stage_cash_limit(self) -> None:
         config = base_config()
-        config["execution"]["mode"] = "ths_computer_use"
+        config["execution"]["mode"] = "ths_applescript"
         config["execution"]["stage"] = "small_live"
         manager = trading_engine.RiskManager(config, self.clock)
         signal = trading_engine.OrderSignal("588330", "BUY", 600, 10.0)
@@ -116,7 +128,7 @@ class TradingEngineSafetyTests(unittest.TestCase):
 
     def test_risk_allows_sim_run_with_simulation_account(self) -> None:
         config = base_config()
-        config["execution"]["mode"] = "ths_computer_use"
+        config["execution"]["mode"] = "ths_applescript"
         config["execution"]["stage"] = "sim_run"
         config["execution"]["ths_account_mode"] = "simulation"
         manager = trading_engine.RiskManager(config, self.clock)
@@ -126,9 +138,39 @@ class TradingEngineSafetyTests(unittest.TestCase):
 
         self.assertTrue(decision.allowed, decision.reason)
 
+    def test_simulation_can_trade_same_symbol_again_with_daily_limit(self) -> None:
+        config = base_config()
+        config["execution"]["mode"] = "ths_applescript"
+        config["execution"]["stage"] = "sim_run"
+        config["execution"]["simulation_allow_repeated_symbol_trades"] = True
+        config["risk"]["max_orders_per_day"] = 2
+        manager = trading_engine.RiskManager(config, self.clock)
+        self.portfolio.position("588330")["quantity"] = 100
+        self.portfolio.mark_trade("588330", "2026-06-15")
+
+        decision = manager.validate_order(
+            trading_engine.OrderSignal("588330", "SELL", 100, 1.0), self.portfolio, "2026-06-15"
+        )
+
+        self.assertTrue(decision.allowed, decision.reason)
+
+    def test_simulation_repeated_trades_still_obey_daily_limit(self) -> None:
+        config = base_config()
+        config["execution"]["simulation_allow_repeated_symbol_trades"] = True
+        config["risk"]["max_orders_per_day"] = 1
+        manager = trading_engine.RiskManager(config, self.clock)
+        self.portfolio.mark_trade("588330", "2026-06-15")
+
+        decision = manager.validate_order(
+            trading_engine.OrderSignal("588330", "BUY", 100, 1.0), self.portfolio, "2026-06-15"
+        )
+
+        self.assertFalse(decision.allowed)
+        self.assertIn("最大交易次数", decision.reason)
+
     def test_risk_blocks_sim_run_with_live_account(self) -> None:
         config = base_config()
-        config["execution"]["mode"] = "ths_computer_use"
+        config["execution"]["mode"] = "ths_applescript"
         config["execution"]["stage"] = "sim_run"
         config["execution"]["ths_account_mode"] = "live"
         config["execution"]["live_account_enabled"] = True
@@ -181,9 +223,9 @@ class TradingEngineSafetyTests(unittest.TestCase):
 
     def test_ths_field_verification_requires_exact_order_fields(self) -> None:
         config = base_config()
-        config["execution"]["mode"] = "ths_computer_use"
+        config["execution"]["mode"] = "ths_applescript"
         config["execution"]["stage"] = "gui_simulation"
-        executor = trading_engine.ThsComputerUseExecutor(config)
+        executor = trading_engine.ThsAppleScriptExecutor(config)
         signal = trading_engine.OrderSignal("588330", "SELL", 200, 1.234)
 
         ok, message = executor._verify_fields(
@@ -193,8 +235,9 @@ class TradingEngineSafetyTests(unittest.TestCase):
                 "symbol": "588330",
                 "side": "SELL",
                 "quantity": 200,
+                "sellable_quantity": 200,
                 "limit_price": 1.234,
-                "source": "codex_computer_use",
+                "source": "applescript_bridge",
             },
         )
 
@@ -202,7 +245,7 @@ class TradingEngineSafetyTests(unittest.TestCase):
 
     def test_ths_field_verification_rejects_wrong_side(self) -> None:
         config = base_config()
-        executor = trading_engine.ThsComputerUseExecutor(config)
+        executor = trading_engine.ThsAppleScriptExecutor(config)
         signal = trading_engine.OrderSignal("588330", "SELL", 200, 1.234)
 
         ok, message = executor._verify_fields(
@@ -213,35 +256,71 @@ class TradingEngineSafetyTests(unittest.TestCase):
                 "side": "BUY",
                 "quantity": 200,
                 "limit_price": 1.234,
-                "source": "codex_computer_use",
+                "source": "applescript_bridge",
             },
         )
 
         self.assertFalse(ok)
         self.assertIn("方向", message)
 
-    def test_ths_computer_use_requires_fresh_codex_verification_file(self) -> None:
+    def test_ths_field_verification_rejects_bridge_validation_errors(self) -> None:
+        executor = trading_engine.ThsAppleScriptExecutor(base_config())
+        signal = trading_engine.OrderSignal("588330", "SELL", 100, 1.234)
+
+        ok, message = executor._verify_fields(
+            signal,
+            {
+                "account_mode": "simulation", "symbol": "588330", "side": "SELL",
+                "quantity": 100, "limit_price": 1.234, "source": "applescript_bridge",
+                "validation_errors": ["missing simulation account context"],
+            },
+        )
+
+        self.assertFalse(ok)
+        self.assertIn("missing simulation account context", message)
+
+    def test_ths_field_verification_accepts_configured_applescript_source(self) -> None:
+        config = base_config()
+        config["execution"]["order_verification_allowed_sources"] = ["applescript_bridge", "applescript_vision_ocr"]
+        executor = trading_engine.ThsAppleScriptExecutor(config)
+        signal = trading_engine.OrderSignal("588330", "BUY", 100, 1.234)
+
+        ok, message = executor._verify_fields(
+            signal,
+            {
+                "account_mode": "simulation",
+                "symbol": "588330",
+                "side": "BUY",
+                "quantity": 100,
+                "limit_price": 1.234,
+                "source": "applescript_vision_ocr",
+            },
+        )
+
+        self.assertTrue(ok, message)
+
+    def test_ths_applescript_requires_fresh_bridge_verification_file(self) -> None:
         config = base_config()
         verification_path = Path(self.tempdir.name) / "verified.json"
-        config["execution"]["mode"] = "ths_computer_use"
+        config["execution"]["mode"] = "ths_applescript"
         config["execution"]["stage"] = "gui_simulation"
         config["execution"]["verification_fields_path"] = str(verification_path)
-        executor = trading_engine.ThsComputerUseExecutor(config)
+        executor = trading_engine.ThsAppleScriptExecutor(config)
         signal = trading_engine.OrderSignal("588330", "BUY", 100, 1.234)
 
         result = executor.place_order(signal)
 
         self.assertFalse(result.success)
-        self.assertEqual(result.status, "codex_computer_use_required")
-        self.assertIn("Codex Computer Use", result.message)
+        self.assertEqual(result.status, "gui_bridge_required")
+        self.assertIn("受控 GUI bridge", result.message)
 
-    def test_ths_computer_use_accepts_fresh_verified_fields(self) -> None:
+    def test_ths_applescript_accepts_fresh_verified_fields(self) -> None:
         config = base_config()
         verification_path = Path(self.tempdir.name) / "verified.json"
-        config["execution"]["mode"] = "ths_computer_use"
+        config["execution"]["mode"] = "ths_applescript"
         config["execution"]["stage"] = "gui_simulation"
         config["execution"]["verification_fields_path"] = str(verification_path)
-        executor = trading_engine.ThsComputerUseExecutor(config)
+        executor = trading_engine.ThsAppleScriptExecutor(config)
         signal = trading_engine.OrderSignal("588330", "BUY", 100, 1.234)
 
         original_write_intent = executor._write_intent
@@ -256,7 +335,7 @@ class TradingEngineSafetyTests(unittest.TestCase):
                         "side": "BUY",
                         "quantity": 100,
                         "limit_price": 1.234,
-                        "source": "codex_computer_use",
+                        "source": "applescript_bridge",
                         "submitted": False,
                     },
                     ensure_ascii=False,
@@ -270,16 +349,16 @@ class TradingEngineSafetyTests(unittest.TestCase):
 
         self.assertTrue(result.success)
         self.assertEqual(result.status, "gui_simulation_verified")
-        self.assertEqual(result.verified_fields["source"], "codex_computer_use")
+        self.assertEqual(result.verified_fields["source"], "applescript_bridge")
 
-    def test_ths_computer_use_sim_run_requires_codex_submitted_flag(self) -> None:
+    def test_ths_applescript_sim_run_requires_bridge_submitted_flag(self) -> None:
         config = base_config()
         verification_path = Path(self.tempdir.name) / "verified.json"
-        config["execution"]["mode"] = "ths_computer_use"
+        config["execution"]["mode"] = "ths_applescript"
         config["execution"]["stage"] = "sim_run"
         config["execution"]["final_confirm_enabled"] = True
         config["execution"]["verification_fields_path"] = str(verification_path)
-        executor = trading_engine.ThsComputerUseExecutor(config)
+        executor = trading_engine.ThsAppleScriptExecutor(config)
         signal = trading_engine.OrderSignal("588330", "BUY", 100, 1.234)
 
         original_write_intent = executor._write_intent
@@ -294,7 +373,7 @@ class TradingEngineSafetyTests(unittest.TestCase):
                         "side": "BUY",
                         "quantity": 100,
                         "limit_price": 1.234,
-                        "source": "codex_computer_use",
+                        "source": "applescript_bridge",
                         "submitted": False,
                     },
                     ensure_ascii=False,
@@ -307,13 +386,58 @@ class TradingEngineSafetyTests(unittest.TestCase):
             result = executor.place_order(signal)
 
         self.assertFalse(result.success)
-        self.assertEqual(result.status, "codex_computer_use_submit_required")
+        self.assertEqual(result.status, "gui_bridge_submit_required")
 
-    def test_background_gui_bridge_is_disabled(self) -> None:
-        executor = trading_engine.ThsComputerUseExecutor(base_config())
+    def test_gui_bridge_is_skipped_when_not_configured(self) -> None:
+        executor = trading_engine.ThsAppleScriptExecutor(base_config())
 
-        with self.assertRaisesRegex(RuntimeError, "Codex Computer Use"):
-            executor._run_gui_bridge(Path(self.tempdir.name) / "intent.json")
+        with mock.patch("trading_engine.subprocess.run") as run:
+            result = executor._run_gui_bridge(Path(self.tempdir.name) / "intent.json")
+
+        self.assertIsNone(result)
+        run.assert_not_called()
+
+    def test_gui_bridge_command_receives_intent_verification_and_submit_flag(self) -> None:
+        config = base_config()
+        verification_path = Path(self.tempdir.name) / "verified.json"
+        config["execution"]["verification_fields_path"] = str(verification_path)
+        config["execution"]["gui_bridge_command"] = (
+            "python3 AppBridge_AppleScript.py --action buy "
+            "--interaction-mode {interaction_mode} {visual_fallback_flag} "
+            "--intent {intent_path} --verification {verification_fields_path} {submit_flag}"
+        )
+        executor = trading_engine.ThsAppleScriptExecutor(config)
+        intent_path = Path(self.tempdir.name) / "intent.json"
+        intent_path.write_text("{}", encoding="utf-8")
+
+        with mock.patch("trading_engine.subprocess.run", return_value=mock.Mock(returncode=0, stdout="", stderr="")) as run:
+            result = executor._run_gui_bridge(intent_path, submit=True)
+
+        self.assertEqual(result, verification_path)
+        command = run.call_args.args[0]
+        self.assertIn("AppBridge_AppleScript.py", command)
+        self.assertIn("--submit", command)
+        self.assertIn("--interaction-mode accessibility_first", command)
+        self.assertIn(str(intent_path), command)
+        self.assertIn(str(verification_path), command)
+
+    def test_gui_bridge_can_fail_closed_without_visual_fallback(self) -> None:
+        config = base_config()
+        config["execution"]["ths_visual_fallback_enabled"] = False
+        config["execution"]["gui_bridge_command"] = (
+            "python3 AppBridge_AppleScript.py {visual_fallback_flag}"
+        )
+        executor = trading_engine.ThsAppleScriptExecutor(config)
+        intent_path = Path(self.tempdir.name) / "intent.json"
+        intent_path.write_text("{}", encoding="utf-8")
+
+        with mock.patch(
+            "trading_engine.subprocess.run",
+            return_value=mock.Mock(returncode=0, stdout="", stderr=""),
+        ) as run:
+            executor._run_gui_bridge(intent_path)
+
+        self.assertIn("--no-visual-fallback", run.call_args.args[0])
 
     def test_portfolio_syncs_cash_and_positions_from_account_snapshot(self) -> None:
         snapshot = {
@@ -358,7 +482,7 @@ class TradingEngineSafetyTests(unittest.TestCase):
         self.assertEqual(self.portfolio.data["account_positions"][0]["symbol"], "588330")
         self.assertEqual(self.portfolio.data["account_positions"][0]["position_ratio_pct"], 0.245)
 
-    def test_account_sync_uses_codex_computer_use_snapshot_file(self) -> None:
+    def test_account_sync_uses_applescript_bridge_snapshot_file(self) -> None:
         config = base_config()
         runtime_state = trading_engine.RuntimeState(Path(self.tempdir.name) / "runtime_state.json")
         snapshot_path = Path(self.tempdir.name) / "account.json"
@@ -368,7 +492,7 @@ class TradingEngineSafetyTests(unittest.TestCase):
                     "account_mode": "simulation",
                     "available_cash": 12345.67,
                     "cash_balance": 12345.67,
-                    "source": "codex_computer_use",
+                    "source": "applescript_bridge",
                     "positions": [{"symbol": "588330", "quantity": 200, "avg_cost": 1.23, "market_value": 246.0}],
                 },
                 ensure_ascii=False,
@@ -412,7 +536,7 @@ class TradingEngineSafetyTests(unittest.TestCase):
             encoding="utf-8",
         )
         config["execution"]["account_snapshot_path"] = str(snapshot_path)
-        config["execution"]["account_snapshot_allowed_sources"] = ["codex_computer_use", "apple_vision_ocr"]
+        config["execution"]["account_snapshot_allowed_sources"] = ["applescript_bridge", "apple_vision_ocr"]
 
         ok, message = trading_engine.sync_portfolio_from_account(config, self.portfolio, runtime_state)
 
@@ -420,7 +544,7 @@ class TradingEngineSafetyTests(unittest.TestCase):
         self.assertEqual(self.portfolio.cash(), 60660.91)
         self.assertEqual(self.portfolio.position("588330")["quantity"], 100)
 
-    def test_account_sync_rejects_apple_vision_snapshot_by_default(self) -> None:
+    def test_account_sync_accepts_apple_vision_snapshot_by_default(self) -> None:
         snapshot_path = Path(self.tempdir.name) / "account.json"
         snapshot_path.write_text(
             json.dumps(
@@ -437,7 +561,8 @@ class TradingEngineSafetyTests(unittest.TestCase):
 
         snapshot = trading_engine.load_recent_account_snapshot(snapshot_path, "simulation")
 
-        self.assertIsNone(snapshot)
+        self.assertIsNotNone(snapshot)
+        self.assertEqual(snapshot["source"], "apple_vision_ocr")
 
     def test_account_sync_rejects_snapshot_with_ocr_validation_errors(self) -> None:
         snapshot_path = Path(self.tempdir.name) / "account.json"
@@ -464,34 +589,34 @@ class TradingEngineSafetyTests(unittest.TestCase):
         self.assertIsNone(snapshot)
 
     def test_account_snapshot_request_runs_apple_bridge_when_allowed(self) -> None:
-        original_request_path = trading_engine.CODEX_COMPUTER_USE_REQUEST_PATH
+        original_request_path = trading_engine.APPLESCRIPT_BRIDGE_REQUEST_PATH
         request_path = Path(self.tempdir.name) / "request.json"
         snapshot_path = Path(self.tempdir.name) / "missing_account.json"
-        trading_engine.CODEX_COMPUTER_USE_REQUEST_PATH = request_path
-        self.addCleanup(setattr, trading_engine, "CODEX_COMPUTER_USE_REQUEST_PATH", original_request_path)
+        trading_engine.APPLESCRIPT_BRIDGE_REQUEST_PATH = request_path
+        self.addCleanup(setattr, trading_engine, "APPLESCRIPT_BRIDGE_REQUEST_PATH", original_request_path)
 
         with mock.patch("trading_engine.run_apple_account_snapshot_bridge") as bridge:
-            trading_engine.request_codex_account_snapshot(
+            trading_engine.request_applescript_account_snapshot(
                 snapshot_path,
                 "simulation",
                 1,
-                allowed_sources={"codex_computer_use", "apple_vision_ocr"},
+                allowed_sources={"applescript_bridge", "apple_vision_ocr"},
             )
 
         bridge.assert_called_once_with(
             snapshot_path,
             symbol="588330",
-            app_name="同花顺至尊版",
-            bundle_id="cn.com.10jqka.iHexinFee",
-            process_name="EQHexinFee",
+            app_name="同花顺",
+            bundle_id="cn.com.10jqka.macstock",
+            process_name="同花顺",
         )
 
     def test_account_snapshot_request_retries_apple_bridge_while_waiting(self) -> None:
-        original_request_path = trading_engine.CODEX_COMPUTER_USE_REQUEST_PATH
+        original_request_path = trading_engine.APPLESCRIPT_BRIDGE_REQUEST_PATH
         request_path = Path(self.tempdir.name) / "request.json"
         snapshot_path = Path(self.tempdir.name) / "missing_account.json"
-        trading_engine.CODEX_COMPUTER_USE_REQUEST_PATH = request_path
-        self.addCleanup(setattr, trading_engine, "CODEX_COMPUTER_USE_REQUEST_PATH", original_request_path)
+        trading_engine.APPLESCRIPT_BRIDGE_REQUEST_PATH = request_path
+        self.addCleanup(setattr, trading_engine, "APPLESCRIPT_BRIDGE_REQUEST_PATH", original_request_path)
         times = iter([0, 0, 0, 0, 0, 0, 0, 10, 10, 10, 10, 20, 20, 20, 31])
 
         def fake_monotonic() -> int:
@@ -505,7 +630,7 @@ class TradingEngineSafetyTests(unittest.TestCase):
             mock.patch("trading_engine.time.monotonic", side_effect=fake_monotonic),
             mock.patch("trading_engine.time.sleep", return_value=None),
         ):
-            trading_engine.request_codex_account_snapshot(
+            trading_engine.request_applescript_account_snapshot(
                 snapshot_path,
                 "simulation",
                 30,
@@ -513,6 +638,7 @@ class TradingEngineSafetyTests(unittest.TestCase):
             )
 
         self.assertGreaterEqual(bridge.call_count, 2)
+        self.assertFalse(request_path.exists())
 
     def test_apple_account_snapshot_bridge_runs_app_bridge_first_and_writes_configured_snapshot(self) -> None:
         snapshot_path = Path(self.tempdir.name) / "custom_account.json"
@@ -530,7 +656,7 @@ class TradingEngineSafetyTests(unittest.TestCase):
             trading_engine.run_apple_account_snapshot_bridge(snapshot_path, symbol="588330")
 
         self.assertEqual(run.call_count, 2)
-        self.assertIn("App_Bridge_AppleScript.py", run.call_args_list[0].args[0][1])
+        self.assertIn("AppBridge_AppleScript.py", run.call_args_list[0].args[0][1])
         self.assertIn("apple_account_snapshot.py", run.call_args_list[1].args[0][1])
         written = json.loads(snapshot_path.read_text(encoding="utf-8"))
         self.assertEqual(written["source"], "apple_vision_ocr")
@@ -612,13 +738,18 @@ class TradingEngineSafetyTests(unittest.TestCase):
         self.assertTrue(sync.call_args.kwargs["force_refresh"])
 
     def test_account_snapshot_request_marks_timeout(self) -> None:
-        original_request_path = trading_engine.CODEX_COMPUTER_USE_REQUEST_PATH
-        request_path = Path(self.tempdir.name) / "codex_request.json"
+        original_request_path = trading_engine.APPLESCRIPT_BRIDGE_REQUEST_PATH
+        request_path = Path(self.tempdir.name) / "applescript_request.json"
         snapshot_path = Path(self.tempdir.name) / "missing_account.json"
-        trading_engine.CODEX_COMPUTER_USE_REQUEST_PATH = request_path
-        self.addCleanup(setattr, trading_engine, "CODEX_COMPUTER_USE_REQUEST_PATH", original_request_path)
+        trading_engine.APPLESCRIPT_BRIDGE_REQUEST_PATH = request_path
+        self.addCleanup(setattr, trading_engine, "APPLESCRIPT_BRIDGE_REQUEST_PATH", original_request_path)
 
-        trading_engine.request_codex_account_snapshot(snapshot_path, "simulation", 0)
+        trading_engine.request_applescript_account_snapshot(
+            snapshot_path,
+            "simulation",
+            0,
+            allowed_sources={"applescript_bridge"},
+        )
 
         payload = json.loads(request_path.read_text(encoding="utf-8"))
         self.assertEqual(payload["status"], "timed_out")
@@ -626,7 +757,7 @@ class TradingEngineSafetyTests(unittest.TestCase):
 
     def test_ths_field_verification_rejects_live_account_mode(self) -> None:
         config = base_config()
-        executor = trading_engine.ThsComputerUseExecutor(config)
+        executor = trading_engine.ThsAppleScriptExecutor(config)
         signal = trading_engine.OrderSignal("588330", "BUY", 100, 1.234)
 
         ok, message = executor._verify_fields(
@@ -637,7 +768,7 @@ class TradingEngineSafetyTests(unittest.TestCase):
                 "side": "BUY",
                 "quantity": 100,
                 "limit_price": 1.234,
-                "source": "codex_computer_use",
+                "source": "applescript_bridge",
             },
         )
 
@@ -646,7 +777,7 @@ class TradingEngineSafetyTests(unittest.TestCase):
 
     def test_risk_blocks_ths_live_account_without_explicit_enable(self) -> None:
         config = base_config()
-        config["execution"]["mode"] = "ths_computer_use"
+        config["execution"]["mode"] = "ths_applescript"
         config["execution"]["stage"] = "gui_simulation"
         config["execution"]["ths_account_mode"] = "live"
         manager = trading_engine.RiskManager(config, self.clock)
@@ -685,16 +816,84 @@ class TradingEngineSafetyTests(unittest.TestCase):
 
     def test_open_trading_app_uses_configured_app_name(self) -> None:
         with mock.patch("trading_engine.subprocess.run") as run:
-            opened = trading_engine.open_trading_app({"ths_app_name": "同花顺至尊版"})
+            opened = trading_engine.open_trading_app({"ths_app_name": "同花顺"})
 
         self.assertTrue(opened)
         run.assert_called_once_with(
-            ["open", "-a", "同花顺至尊版"],
+            ["open", "-a", "同花顺"],
             check=True,
             capture_output=True,
             text=True,
             timeout=10,
         )
+
+    def test_cleanup_screenshots_deletes_old_artifacts_and_keeps_latest_files(self) -> None:
+        original_dir = trading_engine.SCREENSHOT_DIR
+        screenshot_dir = Path(self.tempdir.name) / "screenshots"
+        screenshot_dir.mkdir()
+        trading_engine.SCREENSHOT_DIR = screenshot_dir
+        self.addCleanup(setattr, trading_engine, "SCREENSHOT_DIR", original_dir)
+        old_file = screenshot_dir / "apple_account_snapshot_20260101T000000.png"
+        fresh_file = screenshot_dir / "apple_account_snapshot_20260707T000000.json"
+        latest_file = screenshot_dir / "latest_account_snapshot.json"
+        ignored_file = screenshot_dir / "notes.txt"
+        for path in (old_file, fresh_file, latest_file, ignored_file):
+            path.write_text("x", encoding="utf-8")
+        now = time.time()
+        os.utime(old_file, (now - 10 * 86400, now - 10 * 86400))
+        os.utime(fresh_file, (now, now))
+        os.utime(latest_file, (now - 30 * 86400, now - 30 * 86400))
+
+        result = trading_engine.cleanup_screenshots(base_config(), now=now)
+
+        self.assertEqual(result.deleted, 1)
+        self.assertFalse(old_file.exists())
+        self.assertTrue(fresh_file.exists())
+        self.assertTrue(latest_file.exists())
+        self.assertTrue(ignored_file.exists())
+
+    def test_cleanup_screenshots_enforces_max_files_with_oldest_first(self) -> None:
+        original_dir = trading_engine.SCREENSHOT_DIR
+        screenshot_dir = Path(self.tempdir.name) / "screenshots"
+        screenshot_dir.mkdir()
+        trading_engine.SCREENSHOT_DIR = screenshot_dir
+        self.addCleanup(setattr, trading_engine, "SCREENSHOT_DIR", original_dir)
+        config = base_config()
+        config["runtime"]["screenshots_cleanup"]["retention_days"] = 30
+        config["runtime"]["screenshots_cleanup"]["max_files"] = 2
+        now = time.time()
+        files = [screenshot_dir / f"apple_bridge_navigation_20260707T00000{i}.json" for i in range(4)]
+        for index, path in enumerate(files):
+            path.write_text("{}", encoding="utf-8")
+            os.utime(path, (now + index, now + index))
+
+        result = trading_engine.cleanup_screenshots(config, now=now + 10)
+
+        self.assertEqual(result.deleted, 2)
+        self.assertFalse(files[0].exists())
+        self.assertFalse(files[1].exists())
+        self.assertTrue(files[2].exists())
+        self.assertTrue(files[3].exists())
+
+    def test_cleanup_screenshots_respects_disabled_unless_forced(self) -> None:
+        original_dir = trading_engine.SCREENSHOT_DIR
+        screenshot_dir = Path(self.tempdir.name) / "screenshots"
+        screenshot_dir.mkdir()
+        trading_engine.SCREENSHOT_DIR = screenshot_dir
+        self.addCleanup(setattr, trading_engine, "SCREENSHOT_DIR", original_dir)
+        config = base_config()
+        config["runtime"]["screenshots_cleanup"]["enabled"] = False
+        old_file = screenshot_dir / "apple_account_snapshot_20260101T000000.json"
+        old_file.write_text("{}", encoding="utf-8")
+        now = time.time()
+        os.utime(old_file, (now - 10 * 86400, now - 10 * 86400))
+
+        skipped = trading_engine.cleanup_screenshots(config, now=now)
+        forced = trading_engine.cleanup_screenshots(config, force=True, now=now)
+
+        self.assertEqual(skipped.deleted, 0)
+        self.assertEqual(forced.deleted, 1)
+        self.assertFalse(old_file.exists())
 
     def test_terminal_color_lines_follow_white_background_palette(self) -> None:
         up_line = trading_engine.color_log_line("实时行情：最新价=1.3630  涨幅=3.26%")
