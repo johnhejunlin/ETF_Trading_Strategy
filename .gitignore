@@ -8,6 +8,7 @@
 __pycache__/
 *.pyc
 *.pyo
+tests/
 
 # Database
 market_data.sqlite3

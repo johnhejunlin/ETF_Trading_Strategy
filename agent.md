@@ -23,7 +23,7 @@
 - `trading_engine.monitor.log`：后台托管运行时的实时监控日志，不上传 GitHub。
 - `runtime_state.json`：执行阶段和 GUI 模拟结果等运行状态记录，不上传 GitHub。
 - `screenshots/`：同花顺截图、订单意图和 GUI 校验凭证，不上传 GitHub。需定期清理。
-- `tests/`：不依赖网络和真实交易的安全单元测试。
+- `tests/`：不依赖网络和真实交易的本地安全单元测试，不上传 GitHub。
 - `requirements.txt`：最小 Python 依赖清单。
 - `backtest_trades*.csv`：回测交易明细，不上传 GitHub。需定期清理。
 - `backtest_*.html`：回测网页报告，不上传 GitHub。需定期清理。
@@ -37,11 +37,12 @@
 - 源码：`trading_engine.py`、`trading_strategy.py`、`market_data.py`、`market_data_store.py`、`backtest.py`
 - 配置与依赖：`config.json`、`requirements.txt`
 - 启停脚本：`Trading_Engine.command`、`automation_start_trading_engine.sh`、`automation_stop_trading_engine.sh`
-- 测试与文档：`tests/`、`README.md`、`agent.md`、`.gitignore`
+- 文档与忽略规则：`README.md`、`agent.md`、`.gitignore`
 
 不应提交：
 
 - 回测结果：`backtest_*.html`、`backtest_*.png`、`backtest_trades_*.csv`
+- 本地测试：`tests/`
 - 行情数据库：`market_data.sqlite3`
 - 本地运行状态：`portfolio.json`、`runtime_state.json`、`signals.csv`、`STOP_TRADING`
 - 日志：`*.log`
@@ -72,6 +73,7 @@
 ## App 交互方式
 
 - 同花顺普通版常规导航、填单和按钮操作应优先使用 macOS Accessibility：按控件语义名称执行 `AXPress`，按“代码/价格/数量”等标签与文本框的几何关系设置并回读 `AXValue`；不得依赖 `child[n]` 控件序号。
+- 同花顺证券代码栏禁止粘贴，也禁止直接设置 `AXValue`；必须聚焦代码文本框后逐字符键入证券代码，让 App 触发证券和市场代码匹配逻辑。价格和数量字段可继续设置并回读 `AXValue`。
 - Accessibility 成功不能替代截图/OCR 安全校验。模拟账户、买卖方向、代码、价格、数量、确认页和提交回执仍必须通过独立视觉校验并保留凭证。
 - `AppBridge_UIMap.py` 和 OCR 坐标点击只用于 Accessibility 未暴露的自绘控件、WebView 或特殊弹窗，不参与常规交易导航和填单。Accessibility 操作成功但 OCR 安全校验失败时必须直接停止，不得转入坐标兜底。
 - 当任务需要与本机 App 互动、操作 App UI、通过截图/OCR 定位控件或使用 AppleScript/System Events 点击时，必须先加载并遵循 `AppBridge_OCRPositionCalculation.py` 。坐标转换要按该 skill 的流程处理：优先激活目标 App 后截图，记录窗口 bounds、截图尺寸、OCR 框和点击坐标，不得把截图像素坐标直接当成 System Events 点击坐标。

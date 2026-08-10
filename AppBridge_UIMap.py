@@ -47,8 +47,13 @@ KNOWN_PAGE_PREFIXES = {
     "trade": "L1F2",
     "simulation": "L1F2.L2F5",
     "buy_form": "L1F2.L2F5.L3F1",
+    "buy_confirmation": "L1F2.L2F5.L3F1.AXSHEET1",
     "sell_form": "L1F2.L2F5.L3F2",
     "holdings": "L1F2.L2F5.L3F4",
+    "orders": "L1F2.L2F5.L3F5",
+    "trades": "L1F2.L2F5.L3F6",
+    "funds": "L1F2.L2F5.L3F7",
+    "sell_confirmation": "L1F2.L2F5.L3F2.AXSHEET1",
     "login_required": "L1F2.L2F5.LOGIN",
     "popup_ad": "POPUP.AD",
     "ad_webview": "AD.WEBVIEW",
@@ -62,6 +67,33 @@ KNOWN_TRANSITIONS = [
     ("simulation", "buy_tab", "buy_form"),
     ("simulation", "sell_tab", "sell_form"),
     ("simulation", "holdings_tab", "holdings"),
+]
+
+KNOWN_ACCESSIBILITY_ELEMENTS = [
+    ("home.trade_button", "home", "交易", "trade_button", "AXButton", {"scope": "window 1", "names": ["交易"]}, "AXPress", False),
+    ("home.a_share_button", "home", "A股", "a_share_button", "AXButton", {"scope": "window 1", "names": ["A股"]}, "AXPress", False),
+    ("home.simulation_button", "home", "模拟", "simulation_button", "AXButton", {"scope": "window 1", "names": ["模拟"]}, "AXPress", False),
+    ("home.stock_button", "home", "股票", "stock_button", "AXButton", {"scope": "window 1", "names": ["股票"]}, "AXPress", False),
+    ("simulation.buy_tab", "simulation", "买入", "buy_tab", "AXButton", {"scope": "window 1", "names": ["买入"]}, "AXPress", False),
+    ("simulation.sell_tab", "simulation", "卖出", "sell_tab", "AXButton", {"scope": "window 1", "names": ["卖出"]}, "AXPress", False),
+    ("simulation.holdings_tab", "simulation", "持仓", "holdings_tab", "AXButton", {"scope": "window 1", "names": ["持仓"]}, "AXPress", False),
+    ("simulation.orders_tab", "simulation", "委托", "orders_tab", "AXButton", {"scope": "window 1", "names": ["委托"]}, "AXPress", False),
+    ("simulation.trades_tab", "simulation", "成交", "trades_tab", "AXButton", {"scope": "window 1", "names": ["成交"]}, "AXPress", False),
+    ("simulation.funds_tab", "simulation", "资金明细", "funds_tab", "AXButton", {"scope": "window 1", "names": ["资金明细"]}, "AXPress", False),
+    ("buy_form.symbol_field", "buy_form", "代码", "symbol_field", "AXTextField", {"scope": "window 1", "near_labels": ["代码", "股票代码", "证券代码"], "input_mode": "type_only", "clipboard_allowed": False}, "AXType", True),
+    ("buy_form.price_field", "buy_form", "价格", "price_field", "AXTextField", {"scope": "window 1", "near_labels": ["价格", "限价"]}, "AXSetValue", True),
+    ("buy_form.quantity_field", "buy_form", "数量", "quantity_field", "AXTextField", {"scope": "window 1", "near_labels": ["数量", "委托数量", "买入量"]}, "AXSetValue", True),
+    ("buy_form.reset_button", "buy_form", "重填", "reset_button", "AXButton", {"scope": "window 1", "names": ["重填"]}, "AXPress", False),
+    ("buy_form.submit_button", "buy_form", "确定买入", "submit_buy_button", "AXButton", {"scope": "window 1", "names": ["确定买入", "买入（模拟账户）", "买入(模拟账户)"]}, "AXPress", True),
+    ("sell_form.symbol_field", "sell_form", "代码", "symbol_field", "AXTextField", {"scope": "window 1", "near_labels": ["代码", "股票代码", "证券代码"], "input_mode": "type_only", "clipboard_allowed": False}, "AXType", True),
+    ("sell_form.price_field", "sell_form", "价格", "price_field", "AXTextField", {"scope": "window 1", "near_labels": ["价格", "限价"]}, "AXSetValue", True),
+    ("sell_form.quantity_field", "sell_form", "数量", "quantity_field", "AXTextField", {"scope": "window 1", "near_labels": ["数量", "委托数量", "卖出量"]}, "AXSetValue", True),
+    ("sell_form.reset_button", "sell_form", "重填", "reset_button", "AXButton", {"scope": "window 1", "names": ["重填"]}, "AXPress", False),
+    ("sell_form.submit_button", "sell_form", "确定卖出", "submit_sell_button", "AXButton", {"scope": "window 1", "names": ["确定卖出", "卖出（模拟账户）", "卖出(模拟账户)"]}, "AXPress", True),
+    ("buy_confirmation.cancel_button", "buy_confirmation", "取消", "cancel_buy_button", "AXButton", {"scope": "window 1/AXSheet 1", "names": ["取消"]}, "AXPress", False),
+    ("buy_confirmation.confirm_button", "buy_confirmation", "确认", "confirm_buy_button", "AXButton", {"scope": "window 1/AXSheet 1", "names": ["确认", "确认买入", "确定买入"]}, "AXPress", True),
+    ("sell_confirmation.cancel_button", "sell_confirmation", "取消", "cancel_sell_button", "AXButton", {"scope": "window 1/AXSheet 1", "names": ["取消"]}, "AXPress", False),
+    ("sell_confirmation.confirm_button", "sell_confirmation", "确认", "confirm_sell_button", "AXButton", {"scope": "window 1/AXSheet 1", "names": ["确认", "确认卖出", "确定卖出"]}, "AXPress", True),
 ]
 
 SIMULATION_MARKERS = ("模拟炒股", "模拟账户", "模拟交易", "模拟练习", "大玩家")
@@ -123,6 +155,11 @@ def initialize_db(conn: sqlite3.Connection) -> None:
             display_text TEXT NOT NULL,
             semantic_name TEXT NOT NULL,
             hierarchy_code TEXT NOT NULL,
+            element_kind TEXT NOT NULL DEFAULT 'ocr',
+            ax_role TEXT,
+            selector_json TEXT NOT NULL DEFAULT '{}',
+            action TEXT,
+            high_risk INTEGER NOT NULL DEFAULT 0,
             first_seen_at TEXT NOT NULL,
             updated_at TEXT NOT NULL,
             FOREIGN KEY(page_id) REFERENCES ui_pages(page_id) ON DELETE CASCADE
@@ -187,11 +224,22 @@ def initialize_db(conn: sqlite3.Connection) -> None:
 
 
 def migrate_db(conn: sqlite3.Connection) -> None:
-    columns = {row["name"] for row in conn.execute("PRAGMA table_info(ui_pages)").fetchall()}
-    if "page_state" not in columns:
+    page_columns = {row["name"] for row in conn.execute("PRAGMA table_info(ui_pages)").fetchall()}
+    if "page_state" not in page_columns:
         conn.execute("ALTER TABLE ui_pages ADD COLUMN page_state TEXT NOT NULL DEFAULT 'unknown'")
-    if "overlay_state" not in columns:
+    if "overlay_state" not in page_columns:
         conn.execute("ALTER TABLE ui_pages ADD COLUMN overlay_state TEXT NOT NULL DEFAULT 'none'")
+    element_columns = {row["name"] for row in conn.execute("PRAGMA table_info(ui_elements)").fetchall()}
+    element_migrations = {
+        "element_kind": "TEXT NOT NULL DEFAULT 'ocr'",
+        "ax_role": "TEXT",
+        "selector_json": "TEXT NOT NULL DEFAULT '{}'",
+        "action": "TEXT",
+        "high_risk": "INTEGER NOT NULL DEFAULT 0",
+    }
+    for column, definition in element_migrations.items():
+        if column not in element_columns:
+            conn.execute(f"ALTER TABLE ui_elements ADD COLUMN {column} {definition}")
 
 
 def seed_known_transitions(conn: sqlite3.Connection) -> None:
@@ -349,6 +397,165 @@ def perform_safe_click(app_name: str, x: float, y: float) -> None:
         "end tell"
     )
     subprocess.run(["osascript", "-e", script], check=True, capture_output=True, text=True, timeout=10)
+
+
+def store_accessibility_element(
+    conn: sqlite3.Connection,
+    *,
+    page_id: str,
+    page_name: str,
+    element_id: str,
+    display_text: str,
+    semantic_name: str,
+    ax_role: str,
+    selector: dict[str, Any],
+    action: str,
+    account_mode: str,
+    high_risk: bool = False,
+    page_state: str | None = None,
+    overlay_state: str | None = None,
+    executable: bool = False,
+) -> dict[str, Any]:
+    """Upsert a semantic Accessibility element without coordinate data."""
+    now = datetime.now().isoformat(timespec="seconds")
+    hierarchy_code = str(selector.get("path", ""))
+    resolved_page_state = page_state or page_id
+    resolved_overlay_state = overlay_state or (
+        "modal" if page_id.endswith("_confirmation") else "none"
+    )
+    anchors = {
+        "simulation": account_mode == "simulation",
+        "expected_page": True,
+        "accessibility": True,
+    }
+    conn.execute(
+        """
+        INSERT INTO ui_pages (
+            page_id, page_name, page_state, overlay_state, account_mode,
+            hierarchy_code, executable, anchors_json, raw_ui_text,
+            first_seen_at, updated_at
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(page_id) DO UPDATE SET
+            page_name=excluded.page_name,
+            page_state=excluded.page_state,
+            overlay_state=excluded.overlay_state,
+            account_mode=excluded.account_mode,
+            hierarchy_code=excluded.hierarchy_code,
+            executable=excluded.executable,
+            anchors_json=excluded.anchors_json,
+            raw_ui_text=excluded.raw_ui_text,
+            updated_at=excluded.updated_at
+        """,
+        (
+            page_id,
+            page_name,
+            resolved_page_state,
+            resolved_overlay_state,
+            account_mode,
+            KNOWN_PAGE_PREFIXES.get(page_id, ""),
+            1 if executable else 0,
+            json_dumps(anchors),
+            display_text,
+            now,
+            now,
+        ),
+    )
+    conn.execute(
+        """
+        INSERT INTO ui_elements (
+            element_id, page_id, display_text, semantic_name, hierarchy_code,
+            element_kind, ax_role, selector_json, action, high_risk,
+            first_seen_at, updated_at
+        )
+        VALUES (?, ?, ?, ?, ?, 'accessibility', ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(element_id) DO UPDATE SET
+            page_id=excluded.page_id,
+            display_text=excluded.display_text,
+            semantic_name=excluded.semantic_name,
+            hierarchy_code=excluded.hierarchy_code,
+            element_kind=excluded.element_kind,
+            ax_role=excluded.ax_role,
+            selector_json=excluded.selector_json,
+            action=excluded.action,
+            high_risk=excluded.high_risk,
+            updated_at=excluded.updated_at
+        """,
+        (
+            element_id,
+            page_id,
+            display_text,
+            semantic_name,
+            hierarchy_code,
+            ax_role,
+            json_dumps(selector),
+            action,
+            1 if high_risk else 0,
+            now,
+            now,
+        ),
+    )
+    conn.commit()
+    return {
+        "page_id": page_id,
+        "element_id": element_id,
+        "element_kind": "accessibility",
+        "display_text": display_text,
+        "ax_role": ax_role,
+        "selector": selector,
+        "action": action,
+        "high_risk": high_risk,
+        "database_path": conn.execute("PRAGMA database_list").fetchone()["file"],
+    }
+
+
+def store_known_accessibility_elements(conn: sqlite3.Connection) -> dict[str, Any]:
+    """Store the complete stable semantic control catalog used by the bridge."""
+    stored: list[str] = []
+    for (
+        element_id,
+        page_id,
+        display_text,
+        semantic_name_value,
+        ax_role,
+        selector,
+        action,
+        high_risk,
+    ) in KNOWN_ACCESSIBILITY_ELEMENTS:
+        is_confirmation = page_id.endswith("_confirmation")
+        selector_payload = {"process": "同花顺", **selector}
+        if "path" not in selector_payload:
+            if selector_payload.get("names"):
+                names = "|".join(selector_payload["names"])
+                selector_payload["path"] = (
+                    f"{selector_payload['scope']}/{ax_role}[name={names}]"
+                )
+            elif selector_payload.get("near_labels"):
+                labels = "|".join(selector_payload["near_labels"])
+                selector_payload["path"] = (
+                    f"{selector_payload['scope']}/{ax_role}[near_label={labels}]"
+                )
+        store_accessibility_element(
+            conn,
+            page_id=page_id,
+            page_name=page_id,
+            element_id=element_id,
+            display_text=display_text,
+            semantic_name=semantic_name_value,
+            ax_role=ax_role,
+            selector=selector_payload,
+            action=action,
+            account_mode="simulation" if page_id != "home" else "unknown",
+            high_risk=high_risk,
+            overlay_state="modal" if is_confirmation else "none",
+            executable=page_id not in {"home", "buy_confirmation", "sell_confirmation"},
+        )
+        stored.append(element_id)
+    return {
+        "stored": len(stored),
+        "element_ids": stored,
+        "database_path": conn.execute("PRAGMA database_list").fetchone()["file"],
+    }
 
 
 def store_page_capture(

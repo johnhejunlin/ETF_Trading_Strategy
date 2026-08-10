@@ -131,22 +131,23 @@ python3 -m unittest discover -s tests
 - `market_data.sqlite3`：行情数据库，保存回测日 K、回测 1 分钟 K 和实时轮询行情，不上传 GitHub。
 - `trading_engine.log`：交易引擎运行日志，不上传 GitHub。
 - `trading_engine.monitor.log`：后台托管运行时建议使用的监控日志，不上传 GitHub。
-- `tests/`：安全测试和基础解析测试。
+- `tests/`：本地安全测试和基础解析测试，不上传 GitHub。
 
 ## GitHub 上传范围
 
-为了保持仓库通用、轻量且不包含本地运行状态，GitHub 只上传源码、配置模板、脚本、测试和文档。
+为了保持仓库通用、轻量且不包含本地运行状态，GitHub 只上传源码、配置模板、脚本和文档；本地测试目录不上传。
 
 会上传：
 
 - 源码：`trading_engine.py`、`trading_strategy.py`、`market_data.py`、`market_data_store.py`、`backtest.py`
 - 配置与依赖：`config.json`、`requirements.txt`
 - 启停脚本：`Trading_Engine.command`、`automation_start_trading_engine.sh`、`automation_stop_trading_engine.sh`
-- 测试与文档：`tests/`、`README.md`、`agent.md`、`.gitignore`
+- 文档与忽略规则：`README.md`、`agent.md`、`.gitignore`
 
 不会上传：
 
 - 回测结果：`backtest_*.html`、`backtest_*.png`、`backtest_trades_*.csv`
+- 本地测试：`tests/`
 - 行情数据库：`market_data.sqlite3`
 - 本地运行状态：`portfolio.json`、`runtime_state.json`、`signals.csv`、`STOP_TRADING`
 - 日志：`*.log`
@@ -191,7 +192,7 @@ launchctl remove com.aistock.tradingengine
 
 同花顺 App 交互采用以下分层：
 
-1. `macOS Accessibility` 是常规交互主路径。按钮通过名称和 `AXPress` 操作；代码、价格、数量通过附近语义标签定位文本框，设置 `AXValue` 后立即回读。禁止依赖 `child[n]` 之类会随界面变化的控件序号。
+1. `macOS Accessibility` 是常规交互主路径。按钮通过名称和 `AXPress` 操作；证券代码栏通过附近语义标签定位后逐字符键入，禁止粘贴或直接设置 `AXValue`，以确保 App 触发市场代码匹配；价格和数量可设置 `AXValue` 并立即回读。禁止依赖 `child[n]` 之类会随界面变化的控件序号。
 2. 截图和 Apple Vision OCR 是独立的安全复核层。即使 Accessibility 写入和回读成功，也必须再次验证模拟账户、方向、代码、价格、数量和确认/回执页面，并保留截图凭证。
 3. OCR 坐标与 `AppBridge_UIMap.py` 只作为 Accessibility 无法识别自绘控件、WebView 或特殊弹窗时的受控兜底。UI Map 不参与常规导航或填单。
 
@@ -211,7 +212,7 @@ launchctl remove com.aistock.tradingengine
 python3 AppBridge_AppleScript.py --action order --intent screenshots/latest_order_intent.json --verification screenshots/latest_verified_order.json
 ```
 
-第一次调用使用 Accessibility 填入对应的模拟买入/卖出表单，逐字段回读后停在委托确认弹窗，再由 OCR 独立校验方向、代码、数量和价格并写回 `submitted=false`；卖出还会在打开确认弹窗前校验界面的可卖数量。当交易引擎在 `sim_run` 且 `final_confirm_enabled=true` 时，第二次调用会复用字段完全匹配的确认弹窗，优先通过 `AXPress` 点击“确认买入”或“确认卖出”，识别“委托已提交/委托成功/合同号”回执后写回 `submitted=true`。
+第一次调用使用 Accessibility 填入对应的模拟买入/卖出表单，逐字段回读后停在委托确认弹窗，再由 OCR 独立校验方向、代码、数量和价格并写回 `submitted=false`；卖出还会在打开确认弹窗前校验界面的可卖数量。当交易引擎在 `sim_run` 且 `final_confirm_enabled=true` 时，第二次调用会复用字段完全匹配的确认弹窗，通过 `AXSheet` 内按钮的 `AXPress` 完成最终确认。确认后固定使用 UI 元素先打开“委托”页、再打开“成交”页并保存截图；即时提交回执、匹配的委托记录或匹配的成交记录均可作为 `submitted=true` 的审计证据。
 
 `AppBridge_UIMap.py` 保留用于采集、诊断和校准 Accessibility 未暴露的界面区域。它不会被交易引擎的正常订单流程自动调用；需要视觉兜底时，应先用安全页面验证坐标转换和目标页面，再允许桥接脚本使用该路径。
 

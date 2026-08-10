@@ -234,6 +234,47 @@ return ""
     return {"method": "accessibility", "action": "AXPress", "target": matched}
 
 
+def ax_press_named_sheet_button(process_name: str, targets: list[str]) -> dict[str, Any]:
+    """Press an enabled named button in the foremost window's AXSheet."""
+    target_list = ", ".join(json.dumps(target, ensure_ascii=False) for target in targets)
+    script = f'''
+set targetNames to {{{target_list}}}
+tell application "System Events"
+  tell process {json.dumps(process_name, ensure_ascii=False)}
+    if exists sheet 1 of window 1 then
+      repeat with targetName in targetNames
+        set matchedElement to missing value
+        try
+          set matchedElement to first button of sheet 1 of window 1 whose name is (targetName as text)
+        end try
+        if matchedElement is not missing value then
+          try
+            set elementEnabled to (enabled of matchedElement is true)
+          on error
+            set elementEnabled to false
+          end try
+          if elementEnabled then
+            perform action "AXPress" of matchedElement
+            return targetName as text
+          end if
+        end if
+      end repeat
+    end if
+  end tell
+end tell
+return ""
+'''
+    matched = run_osascript_output(script)
+    if not matched:
+        raise AppleScriptBridgeError(f"Accessibility sheet button not found: {targets}")
+    return {
+        "method": "accessibility",
+        "action": "AXPress",
+        "container": "AXSheet",
+        "target": matched,
+    }
+
+
 def ax_press_sidebar_button_near_point(
     process_name: str,
     point_x: int,
@@ -365,6 +406,72 @@ end tell
     }
 
 
+def ax_type_text_field_near_label(process_name: str, labels: list[str], value: str) -> dict[str, Any]:
+    """Focus a nearby text field and type characters, without AXValue or paste."""
+    label_list = ", ".join(json.dumps(label, ensure_ascii=False) for label in labels)
+    script = f'''
+set labelNames to {{{label_list}}}
+set requestedValue to {json.dumps(value, ensure_ascii=False)}
+tell application "System Events"
+  tell process {json.dumps(process_name, ensure_ascii=False)}
+    set fieldElements to every text field of window 1
+    set labelElement to missing value
+    set matchedLabel to ""
+    repeat with labelName in labelNames
+      try
+        set labelElement to first static text of window 1 whose name is (labelName as text)
+        set matchedLabel to labelName as text
+      end try
+      if labelElement is not missing value then exit repeat
+    end repeat
+    if labelElement is missing value then return ""
+    set labelPosition to position of labelElement
+    set labelX to item 1 of labelPosition
+    set labelY to item 2 of labelPosition
+    set bestField to missing value
+    set bestDistance to 100000
+    repeat with fieldElement in fieldElements
+      try
+        set fieldPosition to position of fieldElement
+        set fieldX to item 1 of fieldPosition
+        set fieldY to item 2 of fieldPosition
+        set fieldDistance to (fieldY - labelY)
+        if fieldDistance < 0 then set fieldDistance to -fieldDistance
+        if fieldX is greater than or equal to labelX and fieldDistance < bestDistance then
+          set bestDistance to fieldDistance
+          set bestField to fieldElement
+        end if
+      end try
+    end repeat
+    if bestField is missing value or bestDistance > 45 then return ""
+    set focused of bestField to true
+    keystroke "a" using command down
+    key code 51
+    repeat with typedCharacter in characters of requestedValue
+      keystroke (typedCharacter as text)
+      delay 0.08
+    end repeat
+    delay 0.8
+    return matchedLabel & tab & (value of bestField as text)
+  end tell
+end tell
+'''
+    output = run_osascript_output(script)
+    if "\t" not in output:
+        raise AppleScriptBridgeError(f"Accessibility text field not found near labels: {labels}")
+    matched_label, readback = output.split("\t", 1)
+    if readback != value:
+        raise AppleScriptBridgeError(
+            f"Accessibility typed field readback mismatch for {matched_label}: {readback!r} != {value!r}"
+        )
+    return {
+        "method": "accessibility",
+        "action": "AXType",
+        "label": matched_label,
+        "value": readback,
+    }
+
+
 def order_fields_from_controls(controls: list[AXControl]) -> dict[str, str]:
     labels = {
         "symbol": ["代码", "股票代码", "证券代码"],
@@ -481,7 +588,7 @@ def fill_order_form_accessibility(
     limit_price: float,
 ) -> dict[str, str]:
     steps = [
-        ax_set_text_field_near_label(process_name, ["代码", "股票代码", "证券代码"], symbol),
+        ax_type_text_field_near_label(process_name, ["代码", "股票代码", "证券代码"], symbol),
         ax_set_text_field_near_label(process_name, ["价格", "限价"], f"{limit_price:.3f}"),
         ax_set_text_field_near_label(
             process_name,
@@ -530,6 +637,25 @@ def input_text_at(x: int, y: int, text: str) -> None:
         "  delay 0.2\n"
         '  keystroke "v" using command down\n'
         "  delay 0.2\n"
+        "end tell"
+    )
+
+
+def type_text_at(x: int, y: int, text: str) -> None:
+    """Type into a visually located field without using the clipboard."""
+    run_osascript(
+        f'tell application "{DEFAULT_APP_NAME}" to activate\n'
+        'delay 0.1\n'
+        'tell application "System Events"\n'
+        f"  click at {{{x}, {y}}}\n"
+        "  delay 0.25\n"
+        '  keystroke "a" using command down\n'
+        "  key code 51\n"
+        f"  set requestedValue to {json.dumps(text, ensure_ascii=False)}\n"
+        "  repeat with typedCharacter in characters of requestedValue\n"
+        "    keystroke (typedCharacter as text)\n"
+        "    delay 0.08\n"
+        "  end repeat\n"
         "end tell"
     )
 
@@ -683,7 +809,13 @@ def click_ocr_text(
         screen_x += offset_x
         screen_y += offset_y
         click_at(screen_x, screen_y)
-        return {"method": "ocr_text", "target": target, "matched_text": item.text, "x": screen_x, "y": screen_y}
+        return {
+            "method": "ocr_text",
+            "target": target,
+            "matched_text": item.text,
+            "x": screen_x,
+            "y": screen_y,
+        }
     if fallback:
         screen_x, screen_y = relative_point(rect, fallback[0], fallback[1])
         click_at(screen_x, screen_y)
@@ -745,6 +877,31 @@ def capture_ocr(
 
 def raw_text(items: list[OcrText]) -> str:
     return " || ".join(item.text for item in normalize_ocr_text(items))
+
+
+def order_table_text(items: list[OcrText]) -> str:
+    """Return OCR text from the center-left order/trade table, excluding the form and watchlist."""
+    table_items = []
+    for item in items:
+        center_x = item.x + item.width / 2
+        center_y_from_top = 1.0 - (item.y + item.height / 2)
+        if 0.15 <= center_x <= 0.72 and 0.34 <= center_y_from_top <= 0.90:
+            table_items.append(item)
+    return raw_text(table_items)
+
+
+def submission_record_matches(
+    items: list[OcrText],
+    *,
+    page: str,
+    side: str,
+    symbol: str,
+    quantity: int,
+) -> bool:
+    text = order_table_text(items)
+    action = "买入" if side == "BUY" else "卖出"
+    page_marker = "委托数量" if page == "orders" else "成交数量"
+    return all(marker in text for marker in [page_marker, action, symbol, str(quantity)])
 
 
 def is_trade_page(items: list[OcrText]) -> bool:
@@ -901,7 +1058,13 @@ def is_simulated_sell_form(items: list[OcrText]) -> bool:
 def confirm_fields_match(text: str, side: str, symbol: str, quantity: int, limit_price: float) -> tuple[bool, list[str]]:
     errors: list[str] = []
     action = "买入" if side == "BUY" else "卖出"
-    if f"委托{action}确认" not in text and f"确认{action}" not in text:
+    confirmation_markers = [
+        f"委托{action}确认",
+        f"确认{action}",
+        f"{action}委托",
+        f"是否确认以上{action}委托",
+    ]
+    if not any(marker in text for marker in confirmation_markers):
         errors.append(f"missing {side.lower()} confirmation dialog")
     if symbol not in text:
         errors.append(f"missing symbol {symbol}")
@@ -1133,7 +1296,7 @@ def fill_order_form(
     input_points = find_order_form_input_points(image_path, items, rect, symbol)
     if not symbol_selected:
         symbol_x, symbol_y = input_points.get("symbol", relative_point(rect, 0.400, 0.112))
-        input_text_at(symbol_x, symbol_y, symbol)
+        type_text_at(symbol_x, symbol_y, symbol)
         time.sleep(0.8)
         click_relative(rect, 0.142, 0.219)
         time.sleep(1.0)
@@ -1314,10 +1477,16 @@ def run_order(
     submitted = False
     receipt_text = ""
     receipt_path: str | None = None
+    order_path: str | None = None
+    trade_path: str | None = None
+    order_record_verified = False
+    trade_record_verified = False
+    submission_evidence: list[str] = []
     if submit:
+        confirmation_targets = ["确认", f"确认{action}", f"确定{action}"]
         if interaction_mode == "accessibility_first":
             try:
-                click_meta = ax_press_named_control(process_name, [f"确认{action}", f"确定{action}"])
+                click_meta = ax_press_named_sheet_button(process_name, confirmation_targets)
             except AppleScriptBridgeError:
                 if not allow_visual_fallback:
                     raise
@@ -1325,7 +1494,7 @@ def run_order(
                     image_path,
                     items,
                     rect,
-                    [f"确认{action}", f"确定{action}"],
+                    confirmation_targets,
                     min_rel_y=0.35,
                     max_rel_y=0.75,
                     min_rel_x=0.45,
@@ -1336,7 +1505,7 @@ def run_order(
                 image_path,
                 items,
                 rect,
-                [f"确认{action}", f"确定{action}"],
+                confirmation_targets,
                 min_rel_y=0.35,
                 max_rel_y=0.75,
                 min_rel_x=0.45,
@@ -1347,11 +1516,76 @@ def run_order(
         receipt_image_path, receipt_items, _ = capture_ocr(app_name=app_name, process_name=process_name, symbol=symbol, label=f"{label}_receipt")
         receipt_path = str(receipt_image_path)
         receipt_text = raw_text(receipt_items)
-        submitted = any(marker in receipt_text for marker in ["委托已提交", "委托成功", "合同号"])
-        if submitted:
-            click_relative(rect, 0.50, 0.520)
-            steps.append({"label": "receipt_ok", "click": {"method": "fallback_relative", "rel_x": 0.50, "rel_y": 0.520}})
-            time.sleep(0.5)
+        if any(marker in receipt_text for marker in ["委托已提交", "委托成功", "合同号"]):
+            submission_evidence.append("receipt")
+            if interaction_mode == "accessibility_first":
+                try:
+                    receipt_click = ax_press_named_sheet_button(
+                        process_name, ["确认", "确定", "我知道"]
+                    )
+                    steps.append({"label": "receipt_ok", "click": receipt_click})
+                    time.sleep(0.5)
+                except AppleScriptBridgeError:
+                    pass
+
+        if interaction_mode == "accessibility_first":
+            orders_click = ax_press_named_control(process_name, ["委托"])
+            steps.append({"label": "open_orders_for_verification", "click": orders_click})
+            time.sleep(0.8)
+            order_image, order_items, _ = capture_ocr(
+                app_name=app_name,
+                process_name=process_name,
+                symbol=symbol,
+                label=f"{label}_orders_verification",
+            )
+            order_path = str(order_image)
+            order_record_verified = submission_record_matches(
+                order_items,
+                page="orders",
+                side=side,
+                symbol=symbol,
+                quantity=quantity,
+            )
+            if order_record_verified:
+                submission_evidence.append("orders")
+            steps.append(
+                {
+                    "label": "verify_orders",
+                    "screenshot_path": order_path,
+                    "matched": order_record_verified,
+                    "table_text": order_table_text(order_items),
+                }
+            )
+
+            trades_click = ax_press_named_control(process_name, ["成交"])
+            steps.append({"label": "open_trades_for_verification", "click": trades_click})
+            time.sleep(0.8)
+            trade_image, trade_items, _ = capture_ocr(
+                app_name=app_name,
+                process_name=process_name,
+                symbol=symbol,
+                label=f"{label}_trades_verification",
+            )
+            trade_path = str(trade_image)
+            trade_record_verified = submission_record_matches(
+                trade_items,
+                page="trades",
+                side=side,
+                symbol=symbol,
+                quantity=quantity,
+            )
+            if trade_record_verified:
+                submission_evidence.append("trades")
+            steps.append(
+                {
+                    "label": "verify_trades",
+                    "screenshot_path": trade_path,
+                    "matched": trade_record_verified,
+                    "table_text": order_table_text(trade_items),
+                }
+            )
+
+        submitted = bool(submission_evidence)
 
     result = {
         "created_at": datetime.now().isoformat(timespec="seconds"),
@@ -1366,7 +1600,16 @@ def run_order(
         "screenshot_path": receipt_path or str(image_path),
         "confirmation_screenshot_path": str(image_path),
         "receipt_screenshot_path": receipt_path,
-        "validation_errors": [] if (not submit or submitted) else ["missing submitted receipt"],
+        "order_screenshot_path": order_path,
+        "trade_screenshot_path": trade_path,
+        "order_record_verified": order_record_verified,
+        "trade_record_verified": trade_record_verified,
+        "submission_evidence": submission_evidence,
+        "validation_errors": (
+            []
+            if (not submit or submitted)
+            else ["missing submission evidence from receipt, order list, and trade list"]
+        ),
         "interaction_method": resolved_interaction_method(interaction_mode, steps),
         "accessibility_fields": (
             safe_read_accessibility_order_fields(process_name)
