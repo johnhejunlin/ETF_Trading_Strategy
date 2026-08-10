@@ -32,6 +32,8 @@
 
 本仓库在 GitHub 上应保持通用、轻量、可复现。提交前必须检查 `git status --short --ignored`，确认本地运行产物被 `.gitignore` 忽略。
 
+每次上传 GitHub 前，必须同步更新 `README.md` 中“更新记录”里的“更新内容”，用简短文字说明本次上传包含的主要变化。即使只是配置、脚本、文档或忽略规则调整，也要补充对应更新内容。
+
 应该提交：
 
 - 源码：`trading_engine.py`、`trading_strategy.py`、`market_data.py`、`market_data_store.py`、`backtest.py`
