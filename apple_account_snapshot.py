@@ -469,6 +469,7 @@ def parse_position(raw_text: str, symbol: str, items: list[OcrText]) -> dict[str
     actual_quantity = value_below_header(items, ["实际数量"], row_symbol_y=symbol_y)
     stock_balance = value_below_header(items, ["股票余额"], row_symbol_y=symbol_y)
     available_quantity = value_below_header(items, ["可用余额"], row_symbol_y=symbol_y)
+    avg_cost = value_below_header(items, ["成本价"], row_symbol_y=symbol_y)
     current_price = value_below_header(items, ["市价"], row_symbol_y=symbol_y)
     profit_loss = value_below_header(items, ["盈亏"], row_symbol_y=symbol_y)
     if actual_quantity is not None:
@@ -481,6 +482,8 @@ def parse_position(raw_text: str, symbol: str, items: list[OcrText]) -> dict[str
     elif stock_balance is not None:
         position["sellable_quantity"] = int(stock_balance)
         position["available_quantity"] = int(stock_balance)
+    if avg_cost is not None:
+        position["avg_cost"] = avg_cost
     if current_price is not None:
         position["current_price"] = current_price
     if profit_loss is not None:

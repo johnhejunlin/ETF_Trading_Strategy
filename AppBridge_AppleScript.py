@@ -46,6 +46,7 @@ ROOT = Path(__file__).resolve().parent
 SCREENSHOTS = ROOT / "screenshots"
 DEFAULT_OUTPUT = SCREENSHOTS / "latest_applescript_bridge_holdings.json"
 DEFAULT_VERIFICATION = SCREENSHOTS / "latest_verified_order.json"
+DEFAULT_ACCOUNT_SNAPSHOT = SCREENSHOTS / "latest_account_snapshot.json"
 DEFAULT_APP_NAME = "同花顺"
 DEFAULT_BUNDLE_ID = "cn.com.10jqka.macstock"
 DEFAULT_PROCESS_NAME = "同花顺"
@@ -1093,6 +1094,57 @@ def extract_sellable_quantity(text: str) -> int | None:
     return None
 
 
+def verified_sellable_quantity_from_snapshot(snapshot: dict[str, Any], symbol: str) -> int | None:
+    """Return a sellable quantity only from a fully validated simulation snapshot.
+
+    This is a visual OCR fallback for form layouts that separate ``可用`` from
+    its numeric value. Accessibility readback remains diagnostic evidence only;
+    it does not replace the independently verified screenshot snapshot.
+    """
+    anchors = snapshot.get("anchors", {})
+    if (
+        snapshot.get("source") != "apple_vision_ocr"
+        or snapshot.get("account_mode") != "simulation"
+        or snapshot.get("validation_errors")
+        or not all(anchors.get(key) for key in ("simulation", "position_area", "target_symbol"))
+    ):
+        return None
+    positions = snapshot.get("positions")
+    if not isinstance(positions, list):
+        return None
+    position = next(
+        (
+            item
+            for item in positions
+            if isinstance(item, dict) and item.get("symbol") == symbol
+        ),
+        None,
+    )
+    quantity = position.get("sellable_quantity") if isinstance(position, dict) else None
+    return int(quantity) if isinstance(quantity, (int, float)) and int(quantity) >= 0 else None
+
+
+def load_verified_sellable_quantity(snapshot_path: Path, symbol: str) -> int | None:
+    """Load the account-synchronization sellable quantity for a sell."""
+    try:
+        snapshot = json.loads(snapshot_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError, KeyError, TypeError, json.JSONDecodeError):
+        return None
+    return verified_sellable_quantity_from_snapshot(snapshot, symbol)
+
+
+def confirmation_dialog_items(items: list[OcrText]) -> list[OcrText]:
+    """Restrict confirmation-field OCR to the centered native modal."""
+    dialog_items = []
+    for item in items:
+        center_x = item.x + item.width / 2
+        center_y_from_top = 1.0 - (item.y + item.height / 2)
+        if 0.30 <= center_x <= 0.70 and 0.25 <= center_y_from_top <= 0.80:
+            dialog_items.append(item)
+    # Synthetic/unit OCR fixtures lack real Vision coordinates.
+    return dialog_items or items
+
+
 def resolved_interaction_method(interaction_mode: str, steps: list[dict[str, Any]]) -> str:
     if interaction_mode == "visual_only":
         return "visual_only"
@@ -1330,6 +1382,11 @@ def run_order(
     symbol, side, quantity, limit_price = expected_order_fields(order)
     label = side.lower()
     action = "买入" if side == "BUY" else "卖出"
+    account_sellable_quantity = (
+        load_verified_sellable_quantity(DEFAULT_ACCOUNT_SNAPSHOT, symbol)
+        if side == "SELL"
+        else None
+    )
 
     # A validation-only invocation deliberately leaves the confirmation dialog
     # open. On the submit invocation, resume that exact OCR-verified dialog
@@ -1339,11 +1396,14 @@ def run_order(
     rect = get_any_window_rect(process_name, "同花顺", app_name)
     if rect is None:
         raise RuntimeError(f"cannot locate {process_name} window")
-    image_path, items, _ = capture_ocr(app_name=app_name, process_name=process_name, symbol=symbol, label=f"{label}_resume")
+    image_path, items, snapshot = capture_ocr(
+        app_name=app_name, process_name=process_name, symbol=symbol, label=f"{label}_resume"
+    )
     text = raw_text(items)
-    resumed_fields_match, _ = confirm_fields_match(text, side, symbol, quantity, limit_price)
+    dialog_text = raw_text(confirmation_dialog_items(items))
+    resumed_fields_match, _ = confirm_fields_match(dialog_text, side, symbol, quantity, limit_price)
     resumed = resumed_fields_match and is_simulation_context(text)
-    verified_sellable_quantity = extract_sellable_quantity(text) if side == "SELL" else None
+    verified_sellable_quantity = account_sellable_quantity
     steps: list[dict[str, Any]] = []
 
     if not resumed:
@@ -1369,7 +1429,7 @@ def run_order(
             interaction_mode=interaction_mode,
             allow_visual_fallback=allow_visual_fallback,
         )
-        image_path, items, _ = capture_ocr(
+        image_path, items, snapshot = capture_ocr(
             app_name=app_name, process_name=process_name, symbol=symbol, label=f"{label}_filled"
         )
         if interaction_mode == "accessibility_first":
@@ -1389,9 +1449,8 @@ def run_order(
         if not is_simulated_order_form(items, side):
             raise RuntimeError(f"lost simulated {label} form after filling fields")
         if side == "SELL":
-            verified_sellable_quantity = extract_sellable_quantity(raw_text(items))
             if verified_sellable_quantity is None:
-                raise RuntimeError("cannot verify sellable quantity on simulated sell form")
+                raise RuntimeError("cannot verify sellable quantity from synchronized account data")
             if quantity > verified_sellable_quantity:
                 raise RuntimeError(
                     f"sell quantity {quantity} exceeds verified sellable quantity {verified_sellable_quantity}"
@@ -1429,21 +1488,20 @@ def run_order(
             )
         steps.append({"label": f"{label}_submit_button", "click": click_meta})
         time.sleep(1.2)
-        image_path, items, _ = capture_ocr(
+        image_path, items, snapshot = capture_ocr(
             app_name=app_name, process_name=process_name, symbol=symbol, label=f"{label}_confirm"
         )
         text = raw_text(items)
+        dialog_text = raw_text(confirmation_dialog_items(items))
 
-    ok, validation_errors = confirm_fields_match(text, side, symbol, quantity, limit_price)
+    ok, validation_errors = confirm_fields_match(dialog_text, side, symbol, quantity, limit_price)
     if not is_simulation_context(text):
         ok = False
         validation_errors.append("missing simulation account context")
     if side == "SELL":
         if verified_sellable_quantity is None:
-            verified_sellable_quantity = extract_sellable_quantity(text)
-        if verified_sellable_quantity is None:
             ok = False
-            validation_errors.append("missing verified sellable quantity")
+            validation_errors.append("missing synchronized account sellable quantity")
         elif quantity > verified_sellable_quantity:
             ok = False
             validation_errors.append(
