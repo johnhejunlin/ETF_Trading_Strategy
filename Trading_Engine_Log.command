@@ -17,7 +17,7 @@ echo
 echo "$(date '+%Y-%m-%d %H:%M:%S') 打开同花顺..."
 open -a "同花顺" >/dev/null 2>&1 || open "/Applications/同花顺.app" >/dev/null 2>&1 || true
 
-if ! accessibility_probe="$("$PYTHON_BIN" -c 'import subprocess, sys; result = subprocess.run(["osascript", "-e", "tell application \"System Events\" to tell process \"Terminal\" to return count of UI elements of window 1"], capture_output=True, text=True); sys.stderr.write(result.stderr or result.stdout) if result.returncode else None; raise SystemExit(result.returncode)' 2>&1)"; then
+if ! accessibility_probe="$("$PYTHON_BIN" -c 'import subprocess, sys; result = subprocess.run(["osascript", "-e", "tell application \"System Events\" to tell process \"Terminal\" to return count of UI elements"], capture_output=True, text=True); sys.stderr.write(result.stderr or result.stdout) if result.returncode else None; raise SystemExit(result.returncode)' 2>&1)"; then
   python_app_path="$("$PYTHON_BIN" -c 'import sys; from pathlib import Path; print(Path(sys.prefix) / "Resources" / "Python.app")')"
   echo "$(date '+%Y-%m-%d %H:%M:%S') Python → osascript 辅助功能预检失败，交易引擎未启动。"
   echo "$accessibility_probe"

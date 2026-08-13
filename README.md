@@ -201,6 +201,12 @@ launchctl remove com.aistock.tradingengine
 - `execution.ths_interaction_mode=accessibility_first`：先使用 Accessibility。
 - `execution.ths_visual_fallback_enabled=false`：普通版当前默认关闭坐标兜底，Accessibility 失败时直接安全停止。只有完成普通版页面坐标校准和安全点击验证后才应改为 `true`。
 - `execution.require_screenshot_verification=true`：必须保持开启，不因 Accessibility 可用而跳过视觉复核。
+- `execution.ths_minimize_when_idle=true`：启动账户同步或成功交易后自动最小化同花顺；需要 App 操作时恢复并置前。确认弹窗或任何失败状态下保持可见。
+- `execution.ths_app_ready_timeout_seconds=30`：等待同花顺窗口恢复、置前且 bounds 稳定的最长时间。
+
+每次截图、OCR、Accessibility 操作和坐标点击前都会确认同花顺是未最小化的最前端窗口。截图后会保存前台进程、窗口 ID、bounds、截图尺寸和捕获方式；如果焦点、窗口 ID 或 bounds 在点击前发生变化，旧 OCR 坐标立即失效，桥接会停止并要求重新截图，不会继续点击。空闲最小化不是周期任务，用户之后手动打开同花顺不会被引擎再次强制最小化。
+
+正常启动、账户同步和订单流程均禁用坐标兜底。“交易”侧栏如果没有 Accessibility 名称，只允许 OCR 识别语义锚点后对最近的匿名 `AXButton` 执行 `AXPress`；“模拟”“持仓”和订单控件使用命名 UI 元素。坐标点击只保留给显式 `visual_only` 诊断流程。
 
 `execution.gui_bridge_command` 配置订单 AppleScript bridge；账户同步默认使用项目内置的 AppleScript + Apple Vision OCR bridge。交易引擎会写出 `screenshots/latest_order_intent.json`，然后等待并读取 `screenshots/latest_verified_order.json`；桥接实现必须写入账户模式、订单字段、提交状态、截图路径和可复盘日志。没有特殊要求时不使用 Computer Use 操作同花顺。
 
@@ -243,7 +249,7 @@ python3 apple_account_snapshot.py
 python3 apple_account_snapshot.py --write-latest
 ```
 
-`AppBridge_AppleScript.py` 会打开同花顺并导航到 App 内“模拟交易”的持仓页，写出 `screenshots/latest_applescript_bridge_holdings.json` 作为导航校验凭证；它不会填单或提交订单。`apple_account_snapshot.py` 会通过 CoreGraphics 查找同花顺窗口，使用 `screencapture` 截指定窗口，再用 Apple Vision OCR 读取账户页。默认只写 `screenshots/apple_account_snapshot_*.json` 和 `screenshots/latest_account_ocr.json` 诊断文件；只有 `--write-latest` 才会写入 `screenshots/latest_account_snapshot.json`。交易引擎在 `execution.account_snapshot_allowed_sources` 显式包含 `apple_vision_ocr` 时，会先运行 `AppBridge_AppleScript.py` 校验模拟持仓页，再运行 `apple_account_snapshot.py` 生成标准账户快照；快照没有 `warnings` / `validation_errors` 时才会接受。
+`AppBridge_AppleScript.py` 会打开同花顺并导航到 App 内“模拟交易”的持仓页，写出 `screenshots/latest_applescript_bridge_holdings.json` 作为导航校验凭证；它不会填单或提交订单。导航校验与标准账户快照复用同一次窗口截图和 Apple Vision OCR，避免在同一持仓页重复识别；快照没有 `warnings` / `validation_errors` 时交易引擎才会接受。`apple_account_snapshot.py` 继续作为独立诊断工具，可单独通过 CoreGraphics、`screencapture` 和 Apple Vision OCR 读取账户页。Swift 窗口查询和 OCR helper 会按源码哈希编译并缓存到 `.cache/app_bridge/`，源码更新后自动失效。
 
 `screenshots/` 自动清理策略在 `config.json` 的 `runtime.screenshots_cleanup` 中配置。默认启动时清理超过 7 天的历史截图/诊断 JSON，并在历史文件超过 300 个时优先删除最旧文件；`latest_*` 当前状态文件默认保留，避免误删正在被交易引擎读取的订单意图、校验结果或账户快照。
 
@@ -345,6 +351,9 @@ sqlite3 market_data.sqlite3 ".tables"
 真实交易前请先长时间 dry-run、GUI 模拟和 sim-run。自动化交易可能因为行情延迟、网络、App 弹窗、坐标偏移等原因产生错误操作。当前代码只允许在同花顺模拟账户下提交订单，不会绕过截图/字段校验直接点击真实最终确认。
 
 ## 更新记录
+
+- 更新日期：2026-08-11
+- 更新内容：优化同花顺启动和窗口生命周期：统一 App 打开入口、复用持仓 OCR 快照、增加前台焦点/窗口证据保护、Swift helper 缓存、硬超时、阶段耗时日志及空闲安全最小化。
 
 - 更新日期：2026-08-11
 - 更新内容：更新 AppleScript 模拟交易桥：卖出前改用已验证账户快照校验可卖数量，确认弹窗字段校验限定在居中原生弹窗区域，并在账户快照解析中补充成本价。

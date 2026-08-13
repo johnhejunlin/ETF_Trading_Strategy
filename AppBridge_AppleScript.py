@@ -10,10 +10,8 @@ from __future__ import annotations
 
 import argparse
 import json
-import shutil
 import subprocess
 import sys
-import tempfile
 import time
 from dataclasses import asdict, dataclass
 from datetime import datetime
@@ -32,13 +30,17 @@ from apple_account_snapshot import (
     get_window_rect,
     normalize_ocr_text,
     run,
+    run_cached_swift_helper,
     run_vision_ocr,
 )
 from AppBridge_OCRPositionCalculation import (
+    AppWindowGuardError,
     WindowRect,
     activate_app_for_stable_capture,
+    ensure_app_window_ready,
     image_size_from_file,
     ocr_box_to_click_point,
+    verify_app_window_state,
 )
 
 
@@ -51,6 +53,7 @@ DEFAULT_APP_NAME = "同花顺"
 DEFAULT_BUNDLE_ID = "cn.com.10jqka.macstock"
 DEFAULT_PROCESS_NAME = "同花顺"
 DEFAULT_INTERACTION_MODE = "accessibility_first"
+APP_READY_TIMEOUT_SECONDS = 30.0
 
 
 class AppleScriptBridgeError(RuntimeError):
@@ -73,8 +76,23 @@ class AXControl:
 
 def run_osascript_output(script: str) -> str:
     try:
+        verify_app_window_state(DEFAULT_PROCESS_NAME)
+    except AppWindowGuardError:
+        ensure_app_window_ready(
+            DEFAULT_APP_NAME,
+            process_name=DEFAULT_PROCESS_NAME,
+            timeout_seconds=APP_READY_TIMEOUT_SECONDS,
+            stable_samples=1,
+        )
+    guarded_script = (
+        'tell application "System Events"\n'
+        f'  if (name of first process whose frontmost is true) is not {json.dumps(DEFAULT_PROCESS_NAME, ensure_ascii=False)} then error "THS focus guard failed"\n'
+        'end tell\n'
+        + script
+    )
+    try:
         return subprocess.run(
-            ["osascript", "-e", script],
+            ["osascript", "-e", guarded_script],
             check=True,
             capture_output=True,
             text=True,
@@ -614,12 +632,24 @@ def fill_order_form_accessibility(
     return fields
 
 
-def click_at(x: int, y: int) -> None:
+def click_at(x: int, y: int, *, expected_rect: tuple[int, int, int, int] | None = None) -> None:
+    verify_app_window_state(DEFAULT_PROCESS_NAME, expected_rect=expected_rect)
+    bounds_guard = ""
+    if expected_rect is not None:
+        expected_x, expected_y, expected_width, expected_height = expected_rect
+        bounds_guard = (
+            f"  set expectedBounds to {{{expected_x}, {expected_y}, {expected_width}, {expected_height}}}\n"
+            f"  tell process {json.dumps(DEFAULT_PROCESS_NAME, ensure_ascii=False)}\n"
+            "    set currentPosition to position of window 1\n"
+            "    set currentSize to size of window 1\n"
+            "    set currentBounds to {item 1 of currentPosition, item 2 of currentPosition, item 1 of currentSize, item 2 of currentSize}\n"
+            "    if currentBounds is not expectedBounds then error \"THS bounds guard failed\"\n"
+            "  end tell\n"
+        )
     run_osascript(
-        f'tell application "{DEFAULT_APP_NAME}" to activate\n'
-        'delay 0.1\n'
         'tell application "System Events"\n'
-        f"  click at {{{x}, {y}}}\n"
+        + bounds_guard
+        + f"  click at {{{x}, {y}}}\n"
         "end tell"
     )
 
@@ -663,7 +693,7 @@ def type_text_at(x: int, y: int, text: str) -> None:
 
 def click_relative(rect: tuple[int, int, int, int], rel_x: float, rel_y: float) -> None:
     x, y, width, height = rect
-    click_at(int(x + width * rel_x), int(y + height * rel_y))
+    click_at(int(x + width * rel_x), int(y + height * rel_y), expected_rect=rect)
 
 
 def relative_point(rect: tuple[int, int, int, int], rel_x: float, rel_y: float) -> tuple[int, int]:
@@ -680,16 +710,10 @@ def get_any_window_rect(process_name: str, owner_hint: str, title_hint: str) -> 
     rect = get_window_rect(process_name)
     if rect:
         return rect
-    swift = shutil.which("swift")
-    if not swift:
+    try:
+        output = run_cached_swift_helper("window_list", SWIFT_WINDOWS, [], timeout=10).stdout
+    except (OSError, RuntimeError, subprocess.SubprocessError):
         return None
-    with tempfile.TemporaryDirectory() as tempdir:
-        swift_path = Path(tempdir) / "window_list.swift"
-        swift_path.write_text(SWIFT_WINDOWS, encoding="utf-8")
-        try:
-            output = run([swift, str(swift_path)], timeout=10).stdout
-        except (subprocess.CalledProcessError, subprocess.TimeoutExpired):
-            return None
     candidates: list[tuple[float, tuple[int, int, int, int]]] = []
     for window in json.loads(output):
         owner = str(window.get("owner_name", ""))
@@ -718,6 +742,22 @@ def get_any_window_rect(process_name: str, owner_hint: str, title_hint: str) -> 
         return None
     candidates.sort(reverse=True)
     return candidates[0][1]
+
+
+def captured_window_rect(
+    snapshot: dict[str, Any],
+    fallback: tuple[int, int, int, int],
+) -> tuple[int, int, int, int]:
+    """Use the bounds proven by the latest capture, not pre-activation bounds."""
+    raw_rect = snapshot.get("window_evidence", {}).get("window_rect")
+    if isinstance(raw_rect, (list, tuple)) and len(raw_rect) == 4:
+        try:
+            rect = tuple(int(value) for value in raw_rect)
+        except (TypeError, ValueError):
+            return fallback
+        if rect[2] > 0 and rect[3] > 0:
+            return rect
+    return fallback
 
 
 def ocr_center_to_screen(
@@ -809,7 +849,7 @@ def click_ocr_text(
         target, item, screen_x, screen_y = match
         screen_x += offset_x
         screen_y += offset_y
-        click_at(screen_x, screen_y)
+        click_at(screen_x, screen_y, expected_rect=rect)
         return {
             "method": "ocr_text",
             "target": target,
@@ -819,7 +859,7 @@ def click_ocr_text(
         }
     if fallback:
         screen_x, screen_y = relative_point(rect, fallback[0], fallback[1])
-        click_at(screen_x, screen_y)
+        click_at(screen_x, screen_y, expected_rect=rect)
         return {
             "method": "fallback_relative",
             "target": targets,
@@ -864,15 +904,51 @@ def capture_ocr(
     symbol: str,
     label: str,
 ) -> tuple[Path, list[OcrText], dict[str, Any]]:
+    timings: dict[str, float] = {}
+    started = time.monotonic()
     timestamp = datetime.now().strftime("%Y%m%dT%H%M%S")
     image_path = SCREENSHOTS / f"apple_bridge_navigation_{timestamp}_{label}.png"
-    activate_app_for_stable_capture(app_name, process_name=process_name)
-    rect = get_any_window_rect(process_name, "同花顺", app_name)
-    time.sleep(0.2)
+    ready_started = time.monotonic()
+    ready_state = ensure_app_window_ready(
+        app_name,
+        process_name=process_name,
+        timeout_seconds=APP_READY_TIMEOUT_SECONDS,
+    )
+    timings["app_ready_ms"] = round((time.monotonic() - ready_started) * 1000, 1)
+    rect = tuple(ready_state["window_rect"])
     window_id = get_coregraphics_window_id("同花顺", app_name)
+    if window_id is None:
+        raise AppWindowGuardError(f"cannot identify {process_name} CoreGraphics window")
+    verify_app_window_state(process_name, expected_rect=rect)
+    capture_started = time.monotonic()
     capture_mode = capture_screenshot(image_path, window_id, rect)
+    timings["capture_ms"] = round((time.monotonic() - capture_started) * 1000, 1)
+    state_after_capture = verify_app_window_state(process_name, expected_rect=rect)
+    ocr_started = time.monotonic()
     items = run_vision_ocr(image_path)
+    timings["ocr_ms"] = round((time.monotonic() - ocr_started) * 1000, 1)
+    state_after_ocr = verify_app_window_state(process_name, expected_rect=rect)
+    current_window_id = get_coregraphics_window_id("同花顺", app_name)
+    if current_window_id != window_id:
+        raise AppWindowGuardError(
+            f"{process_name} window id changed; expected={window_id} actual={current_window_id}; recapture required"
+        )
+    parse_started = time.monotonic()
     snapshot = build_snapshot(items, symbol, image_path, capture_mode, frontmost_process_name())
+    timings["snapshot_parse_ms"] = round((time.monotonic() - parse_started) * 1000, 1)
+    image_size = image_size_from_file(image_path)
+    timings["total_ms"] = round((time.monotonic() - started) * 1000, 1)
+    snapshot["window_evidence"] = {
+        "process_name": process_name,
+        "frontmost_process": frontmost_process_name(),
+        "window_id": window_id,
+        "window_rect": list(rect),
+        "image_size": [int(image_size.width), int(image_size.height)],
+        "capture_mode": capture_mode,
+        "frontmost_after_capture": state_after_capture["frontmost"],
+        "frontmost_after_ocr": state_after_ocr["frontmost"],
+    }
+    snapshot["timings_ms"] = timings
     return image_path, items, snapshot
 
 
@@ -1175,12 +1251,14 @@ def navigate_to_order_form(
     symbol_selected = False
 
     def record(label: str) -> tuple[Path, list[OcrText], dict[str, Any]]:
+        nonlocal rect
         image_path, items, snapshot = capture_ocr(
             app_name=app_name,
             process_name=process_name,
             symbol=symbol,
             label=label,
         )
+        rect = captured_window_rect(snapshot, rect)
         diagnostic_path = image_path.with_suffix(".json")
         diagnostic = {
             "label": label,
@@ -1249,7 +1327,7 @@ def navigate_to_order_form(
     close_known_popup(rect, items)
     if is_search_page(items):
         back_x, back_y = relative_point(rect, 0.030, 0.052)
-        click_at(back_x, back_y)
+        click_at(back_x, back_y, expected_rect=rect)
         steps[-1]["click"] = {"method": "fallback_relative", "target": ["<", "＜"], "rel_x": 0.030, "rel_y": 0.052, "x": back_x, "y": back_y}
         time.sleep(1.0)
         image_path, items, _ = record(f"{label}_search_back")
@@ -1257,7 +1335,7 @@ def navigate_to_order_form(
 
     if not is_trade_page(items):
         trade_x, trade_y = relative_point(rect, 0.728, 0.988)
-        click_at(trade_x, trade_y)
+        click_at(trade_x, trade_y, expected_rect=rect)
         steps[-1]["click"] = {"method": "fallback_relative", "target": ["交易"], "rel_x": 0.728, "rel_y": 0.988, "x": trade_x, "y": trade_y}
         time.sleep(1.2)
         image_path, items, _ = record(f"{label}_bottom_trade")
@@ -1704,6 +1782,7 @@ def navigate_to_holdings(
     interaction_mode: str = DEFAULT_INTERACTION_MODE,
     allow_visual_fallback: bool = True,
 ) -> dict[str, Any]:
+    flow_started = time.monotonic()
     SCREENSHOTS.mkdir(parents=True, exist_ok=True)
     activate_app(app_name, bundle_id)
     time.sleep(1.0)
@@ -1715,12 +1794,14 @@ def navigate_to_holdings(
     steps: list[dict[str, Any]] = []
 
     def record(label: str) -> tuple[Path, list[OcrText], dict[str, Any]]:
+        nonlocal rect
         image_path, items, snapshot = capture_ocr(
             app_name=app_name,
             process_name=process_name,
             symbol=symbol,
             label=label,
         )
+        rect = captured_window_rect(snapshot, rect)
         diagnostic_path = image_path.with_suffix(".json")
         diagnostic = {
             "label": label,
@@ -1743,13 +1824,13 @@ def navigate_to_holdings(
         )
         return image_path, items, snapshot
 
-    image_path, items, _ = record("opened")
+    image_path, items, snapshot = record("opened")
 
     for attempt in range(12):
         if not is_login_page(items):
             break
         time.sleep(2.0)
-        image_path, items, _ = record(f"login_wait_{attempt + 1}")
+        image_path, items, snapshot = record(f"login_wait_{attempt + 1}")
     if is_login_page(items):
         raise RuntimeError("THS login did not complete within 24 seconds; refusing navigation")
 
@@ -1777,10 +1858,18 @@ def navigate_to_holdings(
         anchors = {
             "simulation": current_snapshot.get("account_mode") == "simulation",
             "holdings_page": True,
-            "target_symbol": symbol in ordered_text,
-            "target_position_quantity": isinstance(quantity, int),
+            "target_symbol": symbol in ordered_text
+            or (
+                isinstance(current_snapshot.get("market_value"), (int, float))
+                and abs(float(current_snapshot["market_value"])) <= 0.01
+            ),
+            "target_position_quantity": isinstance(quantity, int)
+            or (
+                isinstance(current_snapshot.get("market_value"), (int, float))
+                and abs(float(current_snapshot["market_value"])) <= 0.01
+            ),
         }
-        return {
+        result = {
             "created_at": datetime.now().isoformat(timespec="seconds"),
             "source": "applescript_vision_ocr",
             "app": app_name,
@@ -1791,12 +1880,23 @@ def navigate_to_holdings(
             "quantity": quantity,
             "sellable_quantity": sellable_quantity,
             "position": position,
+            "account_snapshot": current_snapshot,
+            "window_evidence": current_snapshot.get("window_evidence", {}),
             "anchors": anchors,
             "validation_errors": [name for name, ok in anchors.items() if not ok],
             "interaction_method": method,
             "steps": steps,
             "raw_ui_text": ordered_text,
         }
+        result["timings_ms"] = {
+            "navigation_total_ms": round((time.monotonic() - flow_started) * 1000, 1),
+            **current_snapshot.get("timings_ms", {}),
+        }
+        return result
+
+    initial_result = holdings_result(items, snapshot, method="already_on_holdings")
+    if initial_result is not None and not snapshot.get("validation_errors"):
+        return initial_result
 
     if interaction_mode == "accessibility_first":
         try:
@@ -1821,13 +1921,8 @@ def navigate_to_holdings(
                     "error": str(exc),
                 }
             )
-            if not allow_visual_fallback:
-                raise RuntimeError(
-                    f"Accessibility holdings navigation failed and visual fallback is disabled: {exc}"
-                ) from exc
-            # The AX sequence may have entered the trade area before failing on
-            # the custom-drawn top "模拟" tab. Recapture first so we do not click
-            # the left navigation twice based on the stale pre-action image.
+            # The sidebar's buttons are unnamed AXButtons. OCR identifies the
+            # semantic label, but the action itself remains AXPress.
             image_path, items, _ = record("accessibility_failed_state")
             if not is_trade_page(items):
                 # The desktop sidebar's AX buttons are unnamed. Bind the OCR
@@ -1846,35 +1941,43 @@ def navigate_to_holdings(
                 if trade_match is None:
                     raise RuntimeError("OCR text not found: ['交易']")
                 _, _, trade_x, trade_y = trade_match
-                steps[-1]["trade_navigation_fallback"] = ax_press_sidebar_button_near_point(
+                steps[-1]["trade_navigation_accessibility"] = ax_press_sidebar_button_near_point(
                     process_name,
                     trade_x,
                     trade_y,
                 )
                 time.sleep(1.0)
-                image_path, items, _ = record("trade_navigation_fallback")
+                image_path, items, _ = record("trade_navigation_accessibility")
             if not is_trade_page(items):
-                raise RuntimeError("OCR trade navigation click did not reach the trade page")
+                raise RuntimeError("OCR-anchored AXPress did not reach the trade page")
 
             if not is_simulation_context(raw_text(items)):
-                click_meta = click_ocr_text(
-                    image_path,
-                    items,
-                    rect,
-                    ["模拟"],
-                    min_rel_y=0.0,
-                    max_rel_y=0.14,
-                )
-                steps[-1]["simulation_navigation_fallback"] = click_meta
+                try:
+                    simulation_action = ax_press_named_control(process_name, ["模拟"])
+                except AppleScriptBridgeError:
+                    if not allow_visual_fallback:
+                        raise RuntimeError(
+                            "Accessibility simulation control unavailable and visual fallback is disabled"
+                        )
+                    simulation_action = click_ocr_text(
+                        image_path,
+                        items,
+                        rect,
+                        ["模拟"],
+                        min_rel_y=0.0,
+                        max_rel_y=0.14,
+                        offset_y=16,
+                    )
+                steps[-1]["simulation_navigation_accessibility"] = simulation_action
                 time.sleep(1.0)
-                image_path, items, _ = record("simulation_navigation_fallback")
+                image_path, items, _ = record("simulation_navigation_accessibility")
             if not is_simulation_context(raw_text(items)):
-                raise RuntimeError("OCR simulation navigation click did not reach simulated trading")
+                raise RuntimeError("Accessibility simulation navigation did not reach simulated trading")
 
             steps[-1]["accessibility_action"] = ax_press_named_control(process_name, ["持仓"])
             time.sleep(0.8)
-            image_path, items, snapshot = record("holdings_after_navigation_fallback")
-            result = holdings_result(items, snapshot, method="ocr_navigation_then_accessibility")
+            image_path, items, snapshot = record("holdings_after_accessibility_navigation")
+            result = holdings_result(items, snapshot, method="ocr_anchor_accessibility")
             if result is not None:
                 return result
             raise RuntimeError(
@@ -1884,7 +1987,7 @@ def navigate_to_holdings(
     close_known_popup(rect, items)
     if is_search_page(items):
         back_x, back_y = relative_point(rect, 0.030, 0.052)
-        click_at(back_x, back_y)
+        click_at(back_x, back_y, expected_rect=rect)
         click_meta = {"method": "fallback_relative", "target": ["<", "＜"], "rel_x": 0.030, "rel_y": 0.052, "x": back_x, "y": back_y}
         steps[-1]["click"] = click_meta
         time.sleep(1.0)
@@ -1893,7 +1996,7 @@ def navigate_to_holdings(
 
     # Bottom navigation is tiny and often missed by OCR; use the calibrated bottom tab position.
     trade_x, trade_y = relative_point(rect, 0.728, 0.988)
-    click_at(trade_x, trade_y)
+    click_at(trade_x, trade_y, expected_rect=rect)
     click_meta = {"method": "fallback_relative", "target": ["交易"], "rel_x": 0.728, "rel_y": 0.988, "x": trade_x, "y": trade_y}
     steps[-1]["click"] = click_meta
     time.sleep(1.2)
@@ -1901,7 +2004,7 @@ def navigate_to_holdings(
     close_known_popup(rect, items)
     if not is_trade_page(items):
         trade_x, trade_y = relative_point(rect, 0.728, 0.992)
-        click_at(trade_x, trade_y)
+        click_at(trade_x, trade_y, expected_rect=rect)
         click_meta = {
             "method": "fallback_relative",
             "target": ["交易"],
@@ -1958,12 +2061,20 @@ def navigate_to_holdings(
         "simulation": snapshot.get("account_mode") == "simulation"
         or any(key in ordered_text for key in ["模拟交易", "模拟练习区", "梗拟练习区", "模拟"]),
         "holdings_page": "持仓" in ordered_text,
-        "target_symbol": symbol in ordered_text,
-        "target_position_quantity": isinstance(quantity, int),
+        "target_symbol": symbol in ordered_text
+        or (
+            isinstance(snapshot.get("market_value"), (int, float))
+            and abs(float(snapshot["market_value"])) <= 0.01
+        ),
+        "target_position_quantity": isinstance(quantity, int)
+        or (
+            isinstance(snapshot.get("market_value"), (int, float))
+            and abs(float(snapshot["market_value"])) <= 0.01
+        ),
     }
     validation_errors = [name for name, ok in anchors.items() if not ok]
 
-    return {
+    result = {
         "created_at": datetime.now().isoformat(timespec="seconds"),
         "source": "applescript_vision_ocr",
         "app": app_name,
@@ -1974,20 +2085,29 @@ def navigate_to_holdings(
         "quantity": quantity,
         "sellable_quantity": sellable_quantity,
         "position": position,
+        "account_snapshot": snapshot,
+        "window_evidence": snapshot.get("window_evidence", {}),
         "anchors": anchors,
         "validation_errors": validation_errors,
         "interaction_method": "visual_fallback",
         "steps": steps,
         "raw_ui_text": ordered_text,
     }
+    result["timings_ms"] = {
+        "navigation_total_ms": round((time.monotonic() - flow_started) * 1000, 1),
+        **snapshot.get("timings_ms", {}),
+    }
+    return result
 
 
 def main() -> int:
+    global APP_READY_TIMEOUT_SECONDS
     parser = argparse.ArgumentParser(description="Open THS simulated trading pages and verify by OCR")
     parser.add_argument("--action", choices=["holdings", "order", "buy", "sell"], default="holdings")
     parser.add_argument("--app-name", default=DEFAULT_APP_NAME)
     parser.add_argument("--bundle-id", default=DEFAULT_BUNDLE_ID)
     parser.add_argument("--process-name", default=DEFAULT_PROCESS_NAME)
+    parser.add_argument("--ready-timeout", type=float, default=APP_READY_TIMEOUT_SECONDS)
     parser.add_argument("--symbol", default="588330")
     parser.add_argument("--output", type=Path, default=DEFAULT_OUTPUT)
     parser.add_argument("--intent", type=Path, default=SCREENSHOTS / "latest_order_intent.json")
@@ -2004,6 +2124,7 @@ def main() -> int:
         help="fail closed if Accessibility interaction is unavailable",
     )
     args = parser.parse_args()
+    APP_READY_TIMEOUT_SECONDS = max(0.1, args.ready_timeout)
 
     try:
         if args.action in {"order", "buy", "sell"}:

@@ -61,6 +61,160 @@ class OcrClickResult:
     scale_y: float
 
 
+class AppWindowGuardError(RuntimeError):
+    """Raised when a GUI action cannot prove it still targets the THS window."""
+
+
+def read_app_window_state(process_name: str) -> dict[str, object] | None:
+    """Return the frontmost/minimized/modal state and AX window bounds."""
+    script = f'''
+tell application "System Events"
+  if not (exists process {json.dumps(process_name, ensure_ascii=False)}) then return ""
+  tell process {json.dumps(process_name, ensure_ascii=False)}
+    if not (exists window 1) then return ""
+    set isFront to frontmost
+    try
+      set isMinimized to value of attribute "AXMinimized" of window 1
+    on error
+      set isMinimized to false
+    end try
+    try
+      set sheetCount to count of sheets of window 1
+    on error
+      set sheetCount to 0
+    end try
+    set modalCount to 0
+    repeat with candidateWindow in windows
+      try
+        if value of attribute "AXModal" of candidateWindow is true then set modalCount to modalCount + 1
+      end try
+    end repeat
+    set p to position of window 1
+    set s to size of window 1
+    return (isFront as text) & "|" & (isMinimized as text) & "|" & (sheetCount as text) & "|" & (modalCount as text) & "|" & (item 1 of p as text) & "|" & (item 2 of p as text) & "|" & (item 1 of s as text) & "|" & (item 2 of s as text)
+  end tell
+end tell
+'''
+    try:
+        output = subprocess.run(
+            ["osascript", "-e", script],
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=5,
+        ).stdout.strip()
+    except (OSError, subprocess.SubprocessError):
+        return None
+    parts = output.split("|")
+    if len(parts) != 8:
+        return None
+    try:
+        rect = tuple(int(float(value)) for value in parts[4:8])
+        sheet_count = int(float(parts[2]))
+        modal_count = int(float(parts[3]))
+    except ValueError:
+        return None
+    if rect[2] <= 0 or rect[3] <= 0:
+        return None
+    return {
+        "frontmost": parts[0].lower() == "true",
+        "minimized": parts[1].lower() == "true",
+        "sheet_count": sheet_count,
+        "modal_count": modal_count,
+        "window_rect": rect,
+    }
+
+
+def ensure_app_window_ready(
+    app_name: str,
+    *,
+    process_name: str | None = None,
+    timeout_seconds: float = 30.0,
+    stable_samples: int = 2,
+) -> dict[str, object]:
+    """Restore, raise and prove the target window is frontmost and stable."""
+    process = process_name or app_name
+    deadline = time.monotonic() + max(0.1, timeout_seconds)
+    last_rect: tuple[int, int, int, int] | None = None
+    stable_count = 0
+    open_attempted = False
+    while time.monotonic() < deadline:
+        activate_app_for_stable_capture(app_name, process_name=process, settle_seconds=0.0)
+        state = read_app_window_state(process)
+        if state is None and not open_attempted:
+            open_attempted = True
+            try:
+                subprocess.run(
+                    ["open", "-a", app_name],
+                    check=True,
+                    capture_output=True,
+                    text=True,
+                    timeout=min(10.0, max(0.1, deadline - time.monotonic())),
+                )
+            except (OSError, subprocess.SubprocessError):
+                pass
+            time.sleep(0.3)
+            continue
+        if state and state["frontmost"] and not state["minimized"]:
+            rect = tuple(int(value) for value in state["window_rect"])
+            if rect == last_rect:
+                stable_count += 1
+            else:
+                last_rect = rect
+                stable_count = 1
+            if stable_count >= max(1, stable_samples):
+                return state
+        else:
+            stable_count = 0
+            last_rect = None
+        time.sleep(0.2)
+    raise AppWindowGuardError(f"{process} window did not become frontmost and stable within {timeout_seconds:.1f}s")
+
+
+def verify_app_window_state(
+    process_name: str,
+    *,
+    expected_rect: tuple[int, int, int, int] | None = None,
+    tolerance: int = 2,
+) -> dict[str, object]:
+    """Fail closed if focus or bounds changed since the verified capture."""
+    state = read_app_window_state(process_name)
+    if not state or not state["frontmost"] or state["minimized"]:
+        raise AppWindowGuardError(f"{process_name} is not the active, unminimized foreground window")
+    if expected_rect is not None:
+        actual = state["window_rect"]
+        if any(abs(int(a) - int(b)) > tolerance for a, b in zip(actual, expected_rect)):
+            raise AppWindowGuardError(
+                f"{process_name} window bounds changed; expected={expected_rect} actual={actual}; recapture required"
+            )
+    return state
+
+
+def minimize_app_window_if_safe(process_name: str) -> bool:
+    """Minimize only an unambiguous THS window without a native AXSheet."""
+    state = read_app_window_state(process_name)
+    if not state or int(state["sheet_count"]) > 0 or int(state.get("modal_count", 0)) > 0:
+        return False
+    script = f'''
+tell application "System Events"
+  tell process {json.dumps(process_name, ensure_ascii=False)}
+    if exists window 1 then
+      set value of attribute "AXMinimized" of window 1 to true
+      return true
+    end if
+  end tell
+end tell
+return false
+'''
+    try:
+        output = subprocess.run(
+            ["osascript", "-e", script], check=True, capture_output=True, text=True, timeout=5
+        ).stdout.strip()
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return output.lower() == "true"
+
+
 def activate_app_for_stable_capture(
     app_name: str,
     *,
@@ -74,6 +228,7 @@ def activate_app_for_stable_capture(
         "tell application \"System Events\"\n"
         f"  tell process {json.dumps(process, ensure_ascii=False)}\n"
         "    try\n"
+        '      set value of attribute "AXMinimized" of window 1 to false\n'
         "      set frontmost to true\n"
         "      perform action \"AXRaise\" of window 1\n"
         "    end try\n"

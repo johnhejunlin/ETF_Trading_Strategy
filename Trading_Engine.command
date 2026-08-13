@@ -10,11 +10,7 @@ echo "工作目录: $SCRIPT_DIR"
 echo "启动命令: $PYTHON_BIN trading_engine.py"
 echo
 
-echo "打开同花顺..."
-open -a "同花顺" >/dev/null 2>&1 || open "/Applications/同花顺.app" >/dev/null 2>&1 || true
-echo
-
-if ! accessibility_probe="$("$PYTHON_BIN" -c 'import subprocess, sys; result = subprocess.run(["osascript", "-e", "tell application \"System Events\" to tell process \"Terminal\" to return count of UI elements of window 1"], capture_output=True, text=True); sys.stderr.write(result.stderr or result.stdout) if result.returncode else None; raise SystemExit(result.returncode)' 2>&1)"; then
+if ! accessibility_probe="$("$PYTHON_BIN" -c 'import subprocess, sys; result = subprocess.run(["osascript", "-e", "tell application \"System Events\" to tell process \"Terminal\" to return count of UI elements"], capture_output=True, text=True); sys.stderr.write(result.stderr or result.stdout) if result.returncode else None; raise SystemExit(result.returncode)' 2>&1)"; then
   python_app_path="$("$PYTHON_BIN" -c 'import sys; from pathlib import Path; print(Path(sys.prefix) / "Resources" / "Python.app")')"
   echo "Python 子进程无法使用 macOS 辅助功能，交易引擎未启动。"
   echo "$accessibility_probe"

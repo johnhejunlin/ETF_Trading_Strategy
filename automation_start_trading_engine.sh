@@ -13,8 +13,5 @@ if ps ax -o pid=,command= | awk '$0 ~ /[[:space:]]trading_engine[.]py([[:space:]
   exit 0
 fi
 
-echo "$(date '+%Y-%m-%d %H:%M:%S') opening THS app."
-open -a "同花顺" >/dev/null 2>&1 || open "/Applications/同花顺.app" >/dev/null 2>&1 || true
-
 echo "$(date '+%Y-%m-%d %H:%M:%S') opening Trading_Engine.command."
 open "$SCRIPT_DIR/Trading_Engine.command"

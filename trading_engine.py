@@ -17,6 +17,7 @@ from zoneinfo import ZoneInfo
 
 from market_data import EastMoneyMarketData
 from trading_strategy import OrderSignal, TrendPullbackStrategy
+from AppBridge_OCRPositionCalculation import minimize_app_window_if_safe
 
 
 ROOT = Path(__file__).resolve().parent
@@ -615,7 +616,13 @@ class ThsAppleScriptExecutor(Executor):
             logging.warning("截图失败，按配置允许继续: %s", exc)
             return None
 
-    def _run_gui_bridge(self, intent_path: Path, submit: bool = False) -> Optional[Path]:
+    def _run_gui_bridge(
+        self,
+        intent_path: Path,
+        submit: bool = False,
+        *,
+        deadline: Optional[float] = None,
+    ) -> Optional[Path]:
         if not self.gui_bridge_command:
             return None
         verification_path = self._verification_fields_path() or (SCREENSHOT_DIR / "latest_verified_order.json")
@@ -627,6 +634,9 @@ class ThsAppleScriptExecutor(Executor):
             "app_name": shlex.quote(str(self.execution.get("ths_app_name") or "同花顺")),
             "bundle_id": shlex.quote(str(self.execution.get("ths_bundle_id") or "cn.com.10jqka.macstock")),
             "process_name": shlex.quote(str(self.execution.get("ths_process_name") or "同花顺")),
+            "ready_timeout_seconds": shlex.quote(
+                str(max(0.1, float(self.execution.get("ths_app_ready_timeout_seconds", 30))))
+            ),
             "interaction_mode": shlex.quote(
                 str(self.execution.get("ths_interaction_mode") or "accessibility_first")
             ),
@@ -637,6 +647,10 @@ class ThsAppleScriptExecutor(Executor):
         }
         command = self.gui_bridge_command.format(**values)
         logging.info("运行同花顺 GUI bridge: submit=%s command=%s", submit, command)
+        remaining = max(0.1, self.bridge_wait_seconds) if deadline is None else deadline - time.monotonic()
+        if remaining <= 0:
+            logging.warning("同花顺 GUI bridge 已到硬截止时间，未启动新子进程。")
+            return verification_path
         try:
             result = subprocess.run(
                 command,
@@ -645,7 +659,7 @@ class ThsAppleScriptExecutor(Executor):
                 check=False,
                 capture_output=True,
                 text=True,
-                timeout=max(30, self.bridge_wait_seconds or 30),
+                timeout=max(0.1, min(float(self.bridge_wait_seconds or 30), remaining)),
             )
         except (OSError, subprocess.SubprocessError) as exc:
             logging.warning("同花顺 GUI bridge 执行失败: %s", exc)
@@ -655,6 +669,7 @@ class ThsAppleScriptExecutor(Executor):
         return verification_path
 
     def _request_applescript_bridge(self, signal: OrderSignal, intent_path: Path, submit: bool = False) -> None:
+        deadline = time.monotonic() + max(0.1, self.bridge_wait_seconds)
         verification_path = self._verification_fields_path() or (SCREENSHOT_DIR / "latest_verified_order.json")
         payload = {
             "action": "ths_order_submit" if submit else "ths_order_verify",
@@ -679,18 +694,25 @@ class ThsAppleScriptExecutor(Executor):
             "最终提交" if submit else "填单校验",
             APPLESCRIPT_BRIDGE_REQUEST_PATH,
         )
-        self._run_gui_bridge(intent_path, submit=submit)
-        self._wait_for_codex_verification(intent_path, submit=submit)
+        self._run_gui_bridge(intent_path, submit=submit, deadline=deadline)
+        self._wait_for_codex_verification(intent_path, submit=submit, deadline=deadline)
 
-    def _wait_for_codex_verification(self, intent_path: Path, submit: bool = False) -> None:
-        deadline = time.monotonic() + max(0, self.bridge_wait_seconds)
+    def _wait_for_codex_verification(
+        self,
+        intent_path: Path,
+        submit: bool = False,
+        *,
+        deadline: Optional[float] = None,
+    ) -> None:
+        if deadline is None:
+            deadline = time.monotonic() + max(0, self.bridge_wait_seconds)
         while time.monotonic() <= deadline:
             fields = self._read_verified_fields_after(intent_path)
             if fields and (not submit or fields.get("submitted")):
                 return
             if stop_requested():
                 return
-            time.sleep(1)
+            time.sleep(min(1.0, max(0.0, deadline - time.monotonic())))
 
     def _write_intent(self, signal: OrderSignal, submitted_at: str) -> Path:
         SCREENSHOT_DIR.mkdir(exist_ok=True)
@@ -831,6 +853,7 @@ def sync_portfolio_from_account(
             app_name=str(execution.get("ths_app_name") or "同花顺"),
             bundle_id=str(execution.get("ths_bundle_id") or "cn.com.10jqka.macstock"),
             process_name=str(execution.get("ths_process_name") or "同花顺"),
+            ready_timeout_seconds=float(execution.get("ths_app_ready_timeout_seconds", 30)),
         )
         snapshot = load_recent_account_snapshot(
             snapshot_path,
@@ -891,6 +914,7 @@ def request_applescript_account_snapshot(
     app_name: str = "同花顺",
     bundle_id: str = "cn.com.10jqka.macstock",
     process_name: str = "同花顺",
+    ready_timeout_seconds: float = 30,
 ) -> None:
     allowed_sources = allowed_sources or {"apple_vision_ocr"}
     bridge_request_enabled = "applescript_bridge" in allowed_sources
@@ -923,12 +947,17 @@ def request_applescript_account_snapshot(
     next_apple_bridge_at = time.monotonic() if "apple_vision_ocr" in allowed_sources else None
     while time.monotonic() <= deadline:
         if next_apple_bridge_at is not None and time.monotonic() >= next_apple_bridge_at:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
             run_apple_account_snapshot_bridge(
                 snapshot_path,
                 symbol=symbol,
                 app_name=app_name,
                 bundle_id=bundle_id,
                 process_name=process_name,
+                timeout_seconds=remaining,
+                ready_timeout_seconds=ready_timeout_seconds,
             )
             next_apple_bridge_at = time.monotonic() + 10
         snapshot = load_recent_account_snapshot(
@@ -952,7 +981,7 @@ def request_applescript_account_snapshot(
             else:
                 logging.info("仍在等待 AppleScript + Apple Vision OCR 生成账户快照: %s", snapshot_path)
             next_log_at = time.monotonic() + 30
-        time.sleep(1)
+        time.sleep(min(1.0, max(0.0, deadline - time.monotonic())))
     if bridge_request_enabled:
         mark_applescript_request_status("timed_out", f"{wait_seconds}s 内未收到 AppleScript bridge 账户快照。")
 
@@ -963,11 +992,13 @@ def run_apple_app_bridge_navigation(
     app_name: str = "同花顺",
     bundle_id: str = "cn.com.10jqka.macstock",
     process_name: str = "同花顺",
-) -> bool:
+    timeout_seconds: float = 75,
+    ready_timeout_seconds: float = 30,
+) -> Optional[dict]:
     script_path = ROOT / "AppBridge_AppleScript.py"
     if not script_path.exists():
         logging.warning("AppleScript App bridge 脚本不存在: %s", script_path)
-        return False
+        return None
     output_path = SCREENSHOT_DIR / "latest_applescript_bridge_holdings.json"
     try:
         result = subprocess.run(
@@ -980,6 +1011,9 @@ def run_apple_app_bridge_navigation(
                 bundle_id,
                 "--process-name",
                 process_name,
+                "--ready-timeout",
+                str(max(0.1, ready_timeout_seconds)),
+                "--no-visual-fallback",
                 "--symbol",
                 symbol,
                 "--output",
@@ -989,16 +1023,24 @@ def run_apple_app_bridge_navigation(
             check=False,
             capture_output=True,
             text=True,
-            timeout=75,
+            timeout=max(0.1, min(75.0, timeout_seconds)),
         )
     except (OSError, subprocess.SubprocessError) as exc:
         logging.warning("AppleScript App bridge 执行失败: %s", exc)
-        return False
+        return None
     if result.returncode != 0:
         logging.warning("AppleScript App bridge 未完成持仓页校验: %s", result.stderr.strip() or result.stdout.strip())
-        return False
+        return None
+    try:
+        payload = json.loads(output_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        logging.warning("AppleScript App bridge 输出无效: %s", exc)
+        return None
     logging.info("AppleScript App bridge 已进入并校验模拟持仓页: %s", output_path)
-    return True
+    timings = payload.get("account_snapshot", {}).get("timings_ms", {})
+    if timings:
+        logging.info("同花顺账户桥耗时: %s", timings)
+    return payload
 
 
 def run_apple_account_snapshot_bridge(
@@ -1008,50 +1050,29 @@ def run_apple_account_snapshot_bridge(
     app_name: str = "同花顺",
     bundle_id: str = "cn.com.10jqka.macstock",
     process_name: str = "同花顺",
+    timeout_seconds: float = 75,
+    ready_timeout_seconds: float = 30,
 ) -> None:
-    if not run_apple_app_bridge_navigation(
+    navigation = run_apple_app_bridge_navigation(
         symbol,
         app_name=app_name,
         bundle_id=bundle_id,
         process_name=process_name,
-    ):
+        timeout_seconds=timeout_seconds,
+        ready_timeout_seconds=ready_timeout_seconds,
+    )
+    if navigation is None:
         return
-
-    script_path = ROOT / "apple_account_snapshot.py"
-    if not script_path.exists():
-        logging.warning("Apple Vision OCR 账户快照脚本不存在: %s", script_path)
+    snapshot = navigation.get("account_snapshot")
+    if not isinstance(snapshot, dict):
+        logging.warning("AppleScript App bridge 缺少复用账户快照。")
         return
-    try:
-        result = subprocess.run(
-            [
-                sys.executable,
-                str(script_path),
-                "--app-name",
-                app_name,
-                "--bundle-id",
-                bundle_id,
-                "--process-name",
-                process_name,
-                "--symbol",
-                symbol,
-                "--write-latest",
-            ],
-            cwd=ROOT,
-            check=False,
-            capture_output=True,
-            text=True,
-            timeout=45,
+    if snapshot.get("validation_errors") or snapshot.get("warnings"):
+        logging.warning(
+            "Apple Vision OCR 账户快照无效: validation_errors=%s warnings=%s",
+            snapshot.get("validation_errors", []),
+            snapshot.get("warnings", []),
         )
-    except (OSError, subprocess.SubprocessError) as exc:
-        logging.warning("Apple Vision OCR 账户快照桥执行失败: %s", exc)
-        return
-    if result.returncode != 0:
-        logging.warning("Apple Vision OCR 账户快照桥未写回有效快照: %s", result.stderr.strip() or result.stdout.strip())
-        return
-    try:
-        snapshot = json.loads(result.stdout)
-    except json.JSONDecodeError:
-        logging.warning("Apple Vision OCR 账户快照桥输出不是有效 JSON: %s", result.stdout.strip())
         return
     snapshot_path.parent.mkdir(parents=True, exist_ok=True)
     snapshot_path.write_text(json.dumps(snapshot, ensure_ascii=False, indent=2), encoding="utf-8")
@@ -1415,6 +1436,7 @@ def open_live_log_window(path: Path = LOG_PATH) -> bool:
 
 
 def open_trading_app(execution: dict) -> bool:
+    started = time.monotonic()
     app_name = str(execution.get("ths_app_name") or "同花顺").strip()
     if not app_name:
         return False
@@ -1428,12 +1450,25 @@ def open_trading_app(execution: dict) -> bool:
             except (OSError, subprocess.SubprocessError) as fallback_exc:
                 logging.warning("同花顺 App 打开失败: %s；fallback=%s error=%s", app_name, fallback, fallback_exc)
                 return False
-            logging.info("已打开同花顺 App: %s", fallback)
+            logging.info("已打开同花顺 App: %s app_open_ms=%.1f", fallback, (time.monotonic() - started) * 1000)
             return True
         logging.warning("同花顺 App 打开失败: %s；error=%s", app_name, exc)
         return False
-    logging.info("已打开同花顺 App: %s", app_name)
+    logging.info("已打开同花顺 App: %s app_open_ms=%.1f", app_name, (time.monotonic() - started) * 1000)
     return True
+
+
+def minimize_trading_app_if_idle(config: dict, *, reason: str) -> bool:
+    execution = config.get("execution", {})
+    if not bool(execution.get("ths_minimize_when_idle", False)):
+        return False
+    process_name = str(execution.get("ths_process_name") or "同花顺")
+    minimized = minimize_app_window_if_safe(process_name)
+    if minimized:
+        logging.info("同花顺已进入空闲最小化: reason=%s", reason)
+    else:
+        logging.info("同花顺未最小化（窗口不可用或存在 AXSheet）: reason=%s", reason)
+    return minimized
 
 
 def print_status() -> None:
@@ -1611,6 +1646,8 @@ def run_once(
             logging.warning("交易前账户二次校验后不再满足交易条件: %s", refresh_message)
             notifier.notify("AI Stock 交易前校验取消", refresh_message)
             portfolio.save()
+            if refresh_message == "交易前账户资金/持仓验证完成。":
+                minimize_trading_app_if_idle(config, reason="signal_cancelled_after_refresh")
             continue
         if asdict(signal) != asdict(original_signal):
             logging.info("交易前账户二次同步后信号已更新: 原始=%s 最新=%s", original_signal, signal)
@@ -1622,6 +1659,7 @@ def run_once(
             logging.error(message)
             notifier.notify("AI Stock 执行限价异常", message)
             portfolio.save()
+            minimize_trading_app_if_idle(config, reason="limit_price_rejected")
             continue
 
         notifier.notify("AI Stock 生成交易信号", f"{signal.side} {signal.symbol} {signal.quantity} @ {signal.limit_price}；{signal.note}")
@@ -1637,6 +1675,7 @@ def run_once(
             notifier.notify("AI Stock 风控拦截", decision.reason)
             audit_signal(signal, None, decision)
             portfolio.save()
+            minimize_trading_app_if_idle(config, reason="risk_blocked")
             continue
 
         try:
@@ -1668,6 +1707,7 @@ def run_once(
                 notifier.notify("AI Stock 交易后校验失败", sync_message)
             else:
                 logging.info("交易后账户资金/持仓验证完成。")
+                minimize_trading_app_if_idle(config, reason="post_trade_verified")
             notifier.notify("AI Stock 执行成功", f"{result.status}: {result.message}")
             logging.info("%s 已记录交易状态: %s", symbol, signal)
             break
@@ -1739,6 +1779,7 @@ def main() -> None:
         account_synced_after_app_open = sync_account_after_app_open(config)
         if not account_synced_after_app_open:
             return
+        minimize_trading_app_if_idle(config, reason="startup_account_sync_complete")
     if args.ignore_trade_day and execution.get("mode", "dry_run") != "dry_run":
         raise SystemExit("--ignore-trade-day 只允许搭配 execution.mode=dry_run 使用。")
 

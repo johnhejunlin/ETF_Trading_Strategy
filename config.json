@@ -28,6 +28,8 @@
     "ths_process_name": "同花顺",
     "ths_interaction_mode": "accessibility_first",
     "ths_visual_fallback_enabled": false,
+    "ths_minimize_when_idle": true,
+    "ths_app_ready_timeout_seconds": 30,
     "trade_password_env": "THS_TRADE_PASSWORD",
     "stage_cash_limits": {
       "dry_run": 50000,
@@ -47,7 +49,7 @@
     "force_account_sync_on_app_open": true,
     "applescript_bridge_timeout_seconds": 180,
     "account_bridge_command": "",
-    "gui_bridge_command": "python3 AppBridge_AppleScript.py --action order --app-name {app_name} --bundle-id {bundle_id} --process-name {process_name} --interaction-mode {interaction_mode} {visual_fallback_flag} --intent {intent_path} --verification {verification_fields_path} {submit_flag}"
+    "gui_bridge_command": "python3 AppBridge_AppleScript.py --action order --app-name {app_name} --bundle-id {bundle_id} --process-name {process_name} --ready-timeout {ready_timeout_seconds} --interaction-mode {interaction_mode} {visual_fallback_flag} --intent {intent_path} --verification {verification_fields_path} {submit_flag}"
   },
   "notification": {
     "channel": "wechat_client",

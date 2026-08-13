@@ -9,7 +9,9 @@ It does not click or submit orders.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
+import os
 import re
 import shutil
 import subprocess
@@ -21,6 +23,8 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
+from AppBridge_OCRPositionCalculation import ensure_app_window_ready, image_size_from_file, verify_app_window_state
+
 
 ROOT = Path(__file__).resolve().parent
 SCREENSHOTS = ROOT / "screenshots"
@@ -30,6 +34,7 @@ SNAPSHOT_SOURCE = "apple_vision_ocr"
 DEFAULT_APP_NAME = "同花顺"
 DEFAULT_BUNDLE_ID = "cn.com.10jqka.macstock"
 DEFAULT_PROCESS_NAME = "同花顺"
+SWIFT_CACHE = ROOT / ".cache" / "app_bridge"
 
 
 SWIFT_OCR = r'''
@@ -116,6 +121,12 @@ let windows = (CGWindowListCopyWindowInfo(.optionAll, kCGNullWindowID) as? [[Str
     let y = bounds["Y"] as? Double ?? 0
     let width = bounds["Width"] as? Double ?? 0
     let height = bounds["Height"] as? Double ?? 0
+    // macOS can expose transient system windows with infinite bounds. JSONEncoder
+    // rejects non-finite Double values and would otherwise abort the entire
+    // window inventory before the target app window can be selected.
+    guard x.isFinite, y.isFinite, width.isFinite, height.isFinite else {
+        return nil
+    }
     return WindowInfo(window_id: number, owner_name: owner, window_name: name, x: x, y: y, width: width, height: height, is_onscreen: onscreen)
 }
 
@@ -138,6 +149,38 @@ class OcrText:
 
 def run(command: list[str], *, timeout: int = 20) -> subprocess.CompletedProcess[str]:
     return subprocess.run(command, check=True, capture_output=True, text=True, timeout=timeout)
+
+
+def run_cached_swift_helper(
+    name: str,
+    source: str,
+    args: list[str],
+    *,
+    timeout: int,
+) -> subprocess.CompletedProcess[str]:
+    """Compile a source-hashed Swift helper once, with the interpreter as fallback."""
+    swift = shutil.which("swift")
+    if not swift:
+        raise RuntimeError("Swift runtime not found")
+    swiftc = shutil.which("swiftc")
+    digest = hashlib.sha256(source.encode("utf-8")).hexdigest()[:16]
+    binary = SWIFT_CACHE / f"{name}-{digest}"
+    if swiftc and not binary.exists():
+        SWIFT_CACHE.mkdir(parents=True, exist_ok=True)
+        source_path = SWIFT_CACHE / f"{name}-{digest}.swift"
+        temporary_binary = SWIFT_CACHE / f".{name}-{digest}.{os.getpid()}.tmp"
+        source_path.write_text(source, encoding="utf-8")
+        try:
+            run([swiftc, "-O", str(source_path), "-o", str(temporary_binary)], timeout=max(30, timeout))
+            temporary_binary.replace(binary)
+        except (OSError, subprocess.SubprocessError):
+            temporary_binary.unlink(missing_ok=True)
+    if binary.exists():
+        return run([str(binary), *args], timeout=timeout)
+    with tempfile.TemporaryDirectory() as tempdir:
+        swift_path = Path(tempdir) / f"{name}.swift"
+        swift_path.write_text(source, encoding="utf-8")
+        return run([swift, str(swift_path), *args], timeout=timeout)
 
 
 def activate_app(app_name: str, bundle_id: str | None) -> None:
@@ -187,16 +230,10 @@ def get_window_rect(process_name: str) -> tuple[int, int, int, int] | None:
 
 
 def get_coregraphics_window_id(owner_hint: str, title_hint: str | None) -> int | None:
-    swift = shutil.which("swift")
-    if not swift:
+    try:
+        output = run_cached_swift_helper("window_list", SWIFT_WINDOWS, [], timeout=10).stdout
+    except (OSError, RuntimeError, subprocess.SubprocessError):
         return None
-    with tempfile.TemporaryDirectory() as tempdir:
-        swift_path = Path(tempdir) / "window_list.swift"
-        swift_path.write_text(SWIFT_WINDOWS, encoding="utf-8")
-        try:
-            output = run([swift, str(swift_path)], timeout=10).stdout
-        except (subprocess.CalledProcessError, subprocess.TimeoutExpired):
-            return None
     windows = json.loads(output)
     candidates = []
     for window in windows:
@@ -236,13 +273,7 @@ def capture_screenshot(path: Path, window_id: int | None, rect: tuple[int, int, 
 
 
 def run_vision_ocr(image_path: Path) -> list[OcrText]:
-    swift = shutil.which("swift")
-    if not swift:
-        raise RuntimeError("Swift runtime not found; Apple Vision OCR cannot run")
-    with tempfile.TemporaryDirectory() as tempdir:
-        swift_path = Path(tempdir) / "vision_ocr.swift"
-        swift_path.write_text(SWIFT_OCR, encoding="utf-8")
-        output = run([swift, str(swift_path), str(image_path)], timeout=40).stdout
+    output = run_cached_swift_helper("vision_ocr", SWIFT_OCR, [str(image_path)], timeout=40).stdout
     payload = json.loads(output)
     return [OcrText(**item) for item in payload]
 
@@ -501,7 +532,11 @@ def parse_position(raw_text: str, symbol: str, items: list[OcrText]) -> dict[str
 def validate_snapshot(snapshot: dict[str, Any], symbol: str) -> list[str]:
     errors: list[str] = []
     anchors = snapshot.get("anchors", {})
-    missing_anchors = [key for key in ("simulation", "total_assets", "available_cash", "position_area", "target_symbol") if not anchors.get(key)]
+    market_value = snapshot.get("market_value")
+    required_anchors = ["simulation", "total_assets", "available_cash", "position_area"]
+    if not isinstance(market_value, (int, float)) or abs(float(market_value)) > 0.01:
+        required_anchors.append("target_symbol")
+    missing_anchors = [key for key in required_anchors if not anchors.get(key)]
     if missing_anchors:
         errors.append("missing anchors: " + ", ".join(missing_anchors))
     if snapshot.get("account_mode") != "simulation":
@@ -512,7 +547,6 @@ def validate_snapshot(snapshot: dict[str, Any], symbol: str) -> list[str]:
     total_assets = snapshot.get("total_assets")
     available_cash = snapshot.get("available_cash")
     cash_balance = snapshot.get("cash_balance")
-    market_value = snapshot.get("market_value")
     for field, value in (
         ("total_assets", total_assets),
         ("available_cash/cash_balance", available_cash if available_cash is not None else cash_balance),
@@ -531,7 +565,8 @@ def validate_snapshot(snapshot: dict[str, Any], symbol: str) -> list[str]:
         return errors
     position = next((item for item in positions if isinstance(item, dict) and item.get("symbol") == symbol), None)
     if position is None:
-        errors.append(f"target position {symbol} is missing")
+        if not isinstance(market_value, (int, float)) or abs(float(market_value)) > 0.01:
+            errors.append(f"target position {symbol} is missing while market_value is non-zero")
         return errors
     for field in ("quantity", "sellable_quantity", "avg_cost", "current_price", "market_value"):
         if not isinstance(position.get(field), (int, float)):
@@ -583,6 +618,8 @@ def build_snapshot(
         or number_after_label(raw_text, ["总盈亏"])
     )
     position = parse_position(raw_text, symbol, ordered)
+    if isinstance(market_value, (int, float)) and abs(float(market_value)) <= 0.01:
+        position = None
     if (
         position
         and market_value is not None
@@ -608,7 +645,10 @@ def build_snapshot(
         assert cash is not None
         if abs(total_assets - cash - market_value) > max(5.0, total_assets * 0.01):
             warnings.append("total_assets is not close to available_cash + market_value")
-    missing = [key for key, ok in anchors.items() if not ok]
+    required_anchor_names = {"simulation", "total_assets", "available_cash", "position_area"}
+    if not isinstance(market_value, (int, float)) or abs(float(market_value)) > 0.01:
+        required_anchor_names.add("target_symbol")
+    missing = [key for key, ok in anchors.items() if key in required_anchor_names and not ok]
     if missing:
         warnings.append("missing anchors: " + ", ".join(missing))
 
@@ -653,14 +693,30 @@ def main() -> int:
     output_path = args.output or SCREENSHOTS / f"apple_account_snapshot_{timestamp}.json"
 
     if not args.no_activate:
-        activate_app(args.app_name, args.bundle_id)
-        time.sleep(1.0)
+        ready_state = ensure_app_window_ready(args.app_name, process_name=args.process_name)
+        rect = tuple(ready_state["window_rect"])
+    else:
+        rect = get_window_rect(args.process_name)
     frontmost = frontmost_process_name()
     window_id = get_coregraphics_window_id("同花顺", args.app_name)
-    rect = get_window_rect(args.process_name)
+    if not args.no_activate and rect is not None:
+        verify_app_window_state(args.process_name, expected_rect=rect)
     capture_mode = capture_screenshot(image_path, window_id, rect)
+    if not args.no_activate and rect is not None:
+        verify_app_window_state(args.process_name, expected_rect=rect)
     ocr_items = run_vision_ocr(image_path)
+    if not args.no_activate and rect is not None:
+        verify_app_window_state(args.process_name, expected_rect=rect)
     snapshot = build_snapshot(ocr_items, args.symbol, image_path, capture_mode, frontmost)
+    image_size = image_size_from_file(image_path)
+    snapshot["window_evidence"] = {
+        "process_name": args.process_name,
+        "frontmost_process": frontmost_process_name(),
+        "window_id": window_id,
+        "window_rect": list(rect) if rect else None,
+        "image_size": [int(image_size.width), int(image_size.height)],
+        "capture_mode": capture_mode,
+    }
 
     diagnostic = {
         "snapshot": snapshot,
