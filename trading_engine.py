@@ -54,6 +54,7 @@ VALID_SIDES = {"BUY", "SELL"}
 EXECUTION_MODES = {"dry_run", "manual_confirm", "ths_applescript"}
 EXECUTION_STAGES = {"dry_run", "gui_simulation", "sim_run", "small_live", "full_live"}
 THS_ACCOUNT_MODES = {"simulation", "live"}
+PRE_EXECUTION_ACCOUNT_SYNC_OK = "交易前账户资金/持仓验证完成。"
 
 
 @dataclass(frozen=True)
@@ -166,6 +167,7 @@ class PortfolioStore:
             previous_buy_count = int(local.get("buy_count") or 0)
             previous_buy_prices = list(local.get("buy_prices") or [])
             previous_latest_buy_price = local.get("latest_buy_price")
+            previous_latest_buy_price_source = local.get("latest_buy_price_source")
             if not account_position:
                 local.update(self._empty_position())
                 local["last_trade_date"] = previous_last_trade_date
@@ -173,6 +175,19 @@ class PortfolioStore:
 
             quantity = int(account_position.get("quantity") or 0)
             avg_cost = float(account_position.get("avg_cost") or 0.0)
+            has_verified_latest_buy = (
+                previous_latest_buy_price_source == "verified_trade_fill"
+                and isinstance(previous_latest_buy_price, (int, float))
+                and float(previous_latest_buy_price) > 0
+            )
+            reconciled_latest_buy_price = (
+                float(previous_latest_buy_price) if has_verified_latest_buy
+                else (avg_cost if avg_cost > 0 else None)
+            )
+            reconciled_buy_prices = (
+                previous_buy_prices if has_verified_latest_buy
+                else ([avg_cost] if avg_cost > 0 else [])
+            )
             position_ratio_pct = self._position_ratio_pct(account_position, snapshot)
             local.update(
                 {
@@ -192,8 +207,11 @@ class PortfolioStore:
                     "last_trade_date": previous_last_trade_date,
                     "sell_streak": previous_sell_streak,
                     "buy_count": previous_buy_count,
-                    "latest_buy_price": previous_latest_buy_price if quantity > 0 else None,
-                    "buy_prices": previous_buy_prices if quantity > 0 else [],
+                    "latest_buy_price": reconciled_latest_buy_price if quantity > 0 else None,
+                    "latest_buy_price_source": (
+                        "verified_trade_fill" if has_verified_latest_buy else "account_avg_cost"
+                    ) if quantity > 0 and reconciled_latest_buy_price is not None else None,
+                    "buy_prices": reconciled_buy_prices if quantity > 0 else [],
                 }
             )
             if quantity <= 0:
@@ -211,7 +229,7 @@ class PortfolioStore:
         profit_pct = (current_price - avg_cost) / avg_cost
         position["max_profit_pct"] = max(float(position.get("max_profit_pct") or 0.0), profit_pct)
 
-    def apply_fill(self, signal: OrderSignal, fill_price: float) -> None:
+    def apply_fill(self, signal: OrderSignal, fill_price: float, *, price_source: str = "execution_fill") -> None:
         position = self.position(signal.symbol)
         quantity = int(position["quantity"])
         avg_cost = float(position["avg_cost"])
@@ -226,6 +244,7 @@ class PortfolioStore:
             position["sell_streak"] = 0
             position["buy_count"] = int(position.get("buy_count") or 0) + 1
             position["latest_buy_price"] = fill_price
+            position["latest_buy_price_source"] = price_source
             position.setdefault("buy_prices", []).append(fill_price)
             return
 
@@ -251,6 +270,7 @@ class PortfolioStore:
             "sell_streak": 0,
             "buy_count": 0,
             "latest_buy_price": None,
+            "latest_buy_price_source": None,
             "buy_prices": [],
             "last_trade_date": None,
         }
@@ -402,18 +422,18 @@ class RiskManager:
             return RiskDecision(False, "当前不是交易日，禁止下单。")
         if not ignore_hours and not self.clock.is_open():
             return RiskDecision(False, "当前不在配置交易时段内，禁止下单。")
-        if portfolio.traded_today(signal.symbol, today) and not self.allows_repeated_symbol_trades():
-            return RiskDecision(False, f"{signal.symbol} 今日已执行过交易。")
+        if portfolio.traded_today(signal.symbol, today):
+            return RiskDecision(False, f"{signal.symbol} 今日已执行过交易，买入和卖出均被禁止。")
 
         position = portfolio.position(signal.symbol)
         if signal.side == "SELL" and signal.quantity > int(position.get("quantity") or 0):
             return RiskDecision(False, "卖出数量超过本地持仓。")
 
         max_orders_per_day = int(self.risk.get("max_orders_per_day", 1))
-        if max_orders_per_day < 1:
-            return RiskDecision(False, "risk.max_orders_per_day 必须至少为 1。")
-        if portfolio.daily_order_count(today) >= max_orders_per_day:
-            return RiskDecision(False, f"今日已达到最大交易次数 {max_orders_per_day}。")
+        if max_orders_per_day != 1:
+            return RiskDecision(False, "risk.max_orders_per_day 必须为 1，系统每天只允许一次买入或卖出操作。")
+        if portfolio.daily_order_count(today) >= 1:
+            return RiskDecision(False, "今日已执行过一次交易，买入和卖出均被禁止。")
 
         stage = self.execution.get("stage", "dry_run")
         mode = self.execution.get("mode", "dry_run")
@@ -440,12 +460,6 @@ class RiskManager:
                 return RiskDecision(False, f"订单金额 {signal.amount():.2f} 超过阶段上限 {max_cash:.2f}。")
 
         return RiskDecision(True, "风控通过。")
-
-    def allows_repeated_symbol_trades(self) -> bool:
-        return (
-            str(self.execution.get("ths_account_mode", "simulation")) == "simulation"
-            and bool(self.execution.get("simulation_allow_repeated_symbol_trades", False))
-        )
 
     def _stage_allows_mode(self, stage: str, mode: str) -> bool:
         if stage == "dry_run":
@@ -945,21 +959,31 @@ def request_applescript_account_snapshot(
     deadline = time.monotonic() + max(0, wait_seconds)
     next_log_at = time.monotonic() + 30
     next_apple_bridge_at = time.monotonic() if "apple_vision_ocr" in allowed_sources else None
+    apple_bridge_attempted = False
     while time.monotonic() <= deadline:
         if next_apple_bridge_at is not None and time.monotonic() >= next_apple_bridge_at:
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 break
-            run_apple_account_snapshot_bridge(
-                snapshot_path,
-                symbol=symbol,
-                app_name=app_name,
-                bundle_id=bundle_id,
-                process_name=process_name,
-                timeout_seconds=remaining,
-                ready_timeout_seconds=ready_timeout_seconds,
-            )
-            next_apple_bridge_at = time.monotonic() + 10
+            if apple_bridge_attempted and remaining < max(0.1, ready_timeout_seconds):
+                logging.info(
+                    "账户同步剩余 %.1fs，少于 App ready timeout %.1fs；不再启动无法完整执行的 bridge。",
+                    remaining,
+                    ready_timeout_seconds,
+                )
+                next_apple_bridge_at = None
+            else:
+                run_apple_account_snapshot_bridge(
+                    snapshot_path,
+                    symbol=symbol,
+                    app_name=app_name,
+                    bundle_id=bundle_id,
+                    process_name=process_name,
+                    timeout_seconds=remaining,
+                    ready_timeout_seconds=ready_timeout_seconds,
+                )
+                apple_bridge_attempted = True
+                next_apple_bridge_at = time.monotonic() + 10
         snapshot = load_recent_account_snapshot(
             snapshot_path,
             account_mode,
@@ -1543,7 +1567,13 @@ def refresh_signal_before_execution(
         refreshed_signal = refreshed_strategy.generate(symbol, today)
     except RuntimeError as exc:
         return None, refreshed_strategy.last_diagnostics, f"{symbol} 二次账户同步后策略检查失败: {exc}"
-    return refreshed_signal, refreshed_strategy.last_diagnostics, "交易前账户资金/持仓验证完成。"
+    if refreshed_signal is None:
+        if portfolio.traded_today(symbol, today):
+            cancel_reason = f"{symbol} 今日已执行过交易，重复交易保护取消本次信号。"
+        else:
+            cancel_reason = f"{symbol} 账户刷新后策略条件不再满足。"
+        return None, refreshed_strategy.last_diagnostics, f"{PRE_EXECUTION_ACCOUNT_SYNC_OK} {cancel_reason}"
+    return refreshed_signal, refreshed_strategy.last_diagnostics, PRE_EXECUTION_ACCOUNT_SYNC_OK
 
 
 def sync_account_after_execution(config: dict, portfolio: PortfolioStore, runtime_state: RuntimeState) -> tuple[bool, str]:
@@ -1568,6 +1598,22 @@ def apply_execution_limit_price(signal: OrderSignal, quote) -> OrderSignal:
             raise RuntimeError(f"{signal.symbol} 缺少跌停价，禁止生成卖出执行指令。")
         return replace(signal, limit_price=float(price), note=f"{signal.note}；执行限价=跌停价{float(price):.4f}")
     raise RuntimeError(f"未知买卖方向: {signal.side}")
+
+
+def verified_execution_fill_price(
+    result: ExecutionResult,
+    signal: OrderSignal,
+) -> tuple[Optional[float], Optional[str]]:
+    """Return an auditable fill price; never treat a THS order limit as its fill."""
+    if result.status == "dry_run":
+        price = float(signal.limit_price or 0.0)
+        return (price, "dry_run_limit_price") if price > 0 else (None, None)
+    value = result.verified_fields.get("fill_price") if isinstance(result.verified_fields, dict) else None
+    try:
+        price = float(value)
+    except (TypeError, ValueError):
+        return None, None
+    return (price, "verified_trade_fill") if price > 0 else (None, None)
 
 
 def run_once(
@@ -1607,8 +1653,11 @@ def run_once(
     executor = build_executor(config)
 
     for symbol in config["symbols"]:
-        if portfolio.traded_today(symbol, today) and not risk_manager.allows_repeated_symbol_trades():
-            logging.info("%s 今日已执行过交易，跳过。", symbol)
+        if portfolio.daily_order_count(today) >= 1:
+            logging.info("今日已执行过一次交易，所有买入和卖出操作均跳过。")
+            break
+        if portfolio.traded_today(symbol, today):
+            logging.info("%s 今日已执行过交易，买入和卖出操作均跳过。", symbol)
             continue
 
         try:
@@ -1643,10 +1692,15 @@ def run_once(
             today,
         )
         if not signal:
-            logging.warning("交易前账户二次校验后不再满足交易条件: %s", refresh_message)
-            notifier.notify("AI Stock 交易前校验取消", refresh_message)
+            if refresh_message.startswith(PRE_EXECUTION_ACCOUNT_SYNC_OK):
+                cancel_reason = refresh_message[len(PRE_EXECUTION_ACCOUNT_SYNC_OK) :].strip()
+                logging.info("交易前账户同步成功，本次交易信号已取消: %s", cancel_reason)
+                notifier.notify("AI Stock 交易信号取消", cancel_reason)
+            else:
+                logging.warning("交易前账户二次校验失败，本次交易信号已取消: %s", refresh_message)
+                notifier.notify("AI Stock 交易前校验失败", refresh_message)
             portfolio.save()
-            if refresh_message == "交易前账户资金/持仓验证完成。":
+            if refresh_message.startswith(PRE_EXECUTION_ACCOUNT_SYNC_OK):
                 minimize_trading_app_if_idle(config, reason="signal_cancelled_after_refresh")
             continue
         if asdict(signal) != asdict(original_signal):
@@ -1698,7 +1752,20 @@ def run_once(
                 notifier.notify("AI Stock GUI 模拟通过", f"{result.status}: {result.message}")
                 logging.info("%s GUI 模拟校验通过，未记录为真实成交: %s", symbol, signal)
                 break
-            portfolio.apply_fill(signal, signal.limit_price or 0.0)
+            fill_price, fill_price_source = verified_execution_fill_price(result, signal)
+            if fill_price is not None and fill_price_source is not None:
+                portfolio.apply_fill(signal, fill_price, price_source=fill_price_source)
+                logging.info(
+                    "%s 使用成交价更新本地持仓: fill_price=%.4f source=%s",
+                    symbol,
+                    fill_price,
+                    fill_price_source,
+                )
+            else:
+                logging.warning(
+                    "%s 已提交但未取得可验证成交均价；不使用委托限价更新成本，等待账户快照同步。",
+                    symbol,
+                )
             portfolio.mark_trade(symbol, today)
             portfolio.save()
             ok, sync_message = sync_account_after_execution(config, portfolio, runtime_state)

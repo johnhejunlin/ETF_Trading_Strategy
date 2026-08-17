@@ -23,6 +23,8 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
+from PIL import Image
+
 from AppBridge_OCRPositionCalculation import ensure_app_window_ready, image_size_from_file, verify_app_window_state
 
 
@@ -311,6 +313,11 @@ def first_number(text: str) -> float | None:
     return parse_money(match.group(0))
 
 
+def first_present(*values: float | None) -> float | None:
+    """Return the first parsed value, preserving valid numeric zeroes."""
+    return next((value for value in values if value is not None), None)
+
+
 def text_matches_label(text: str, label: str) -> bool:
     normalized = text.replace(" ", "")
     if label == "可用":
@@ -421,6 +428,167 @@ def value_below_header(
     return candidates[0][1]
 
 
+def _component_has_single_hole(mask: list[list[bool]]) -> bool:
+    """Return whether a glyph mask encloses exactly one background region."""
+    if not mask or not mask[0]:
+        return False
+    height = len(mask)
+    width = len(mask[0])
+    padded = [[False] * (width + 2)]
+    padded.extend([[False, *row, False] for row in mask])
+    padded.append([False] * (width + 2))
+    seen: set[tuple[int, int]] = set()
+    holes = 0
+    for start_y in range(height + 2):
+        for start_x in range(width + 2):
+            if padded[start_y][start_x] or (start_x, start_y) in seen:
+                continue
+            stack = [(start_x, start_y)]
+            seen.add((start_x, start_y))
+            touches_edge = False
+            while stack:
+                x, y = stack.pop()
+                if x in (0, width + 1) or y in (0, height + 1):
+                    touches_edge = True
+                for dx, dy in ((-1, 0), (1, 0), (0, -1), (0, 1)):
+                    nx, ny = x + dx, y + dy
+                    if not (0 <= nx < width + 2 and 0 <= ny < height + 2):
+                        continue
+                    if padded[ny][nx] or (nx, ny) in seen:
+                        continue
+                    seen.add((nx, ny))
+                    stack.append((nx, ny))
+            if not touches_edge:
+                holes += 1
+    return holes == 1
+
+
+def detect_zero_in_holdings_cell(
+    image_path: Path,
+    items: list[OcrText],
+    *,
+    header_label: str,
+    row_symbol_y: float | None,
+) -> dict[str, Any] | None:
+    """Recover an OCR-dropped red zero from one anchored holdings-table cell.
+
+    The fallback is deliberately visual rather than semantic: a missing value is
+    never assumed to be zero.  It requires the named table header, the target
+    security row, and a single red ring-shaped glyph inside that exact cell.
+    """
+    if row_symbol_y is None or not image_path.is_file():
+        return None
+    headers = [item for item in items if item.text.replace(" ", "") == header_label]
+    if not headers:
+        return None
+    header = headers[0]
+    header_center_x = header.x + header.width / 2
+    same_row_headers = [
+        item
+        for item in items
+        if item is not header
+        and abs((item.y + item.height / 2) - (header.y + header.height / 2)) <= 0.012
+        and item.text.replace(" ", "")
+        in {
+            "证券代码", "证券名称", "市价", "成本价", "盈亏", "实际数量",
+            "股票余额", "可用余额", "冻结数量", "市值", "仓位占比(%)",
+        }
+    ]
+    left_centers = [item.x + item.width / 2 for item in same_row_headers if item.x + item.width / 2 < header_center_x]
+    right_centers = [item.x + item.width / 2 for item in same_row_headers if item.x + item.width / 2 > header_center_x]
+    left = (max(left_centers) + header_center_x) / 2 if left_centers else header_center_x - max(0.025, header.width)
+    right = (min(right_centers) + header_center_x) / 2 if right_centers else header_center_x + max(0.025, header.width)
+    bottom = max(0.0, row_symbol_y - 0.006)
+    top = min(header.y - 0.002, row_symbol_y + 0.022)
+    if left >= right or bottom >= top:
+        return None
+
+    try:
+        with Image.open(image_path) as source:
+            image = source.convert("RGB")
+            width, height = image.size
+            pixel_box = (
+                max(0, int(left * width)),
+                max(0, int((1.0 - top) * height)),
+                min(width, int(right * width + 0.999)),
+                min(height, int((1.0 - bottom) * height + 0.999)),
+            )
+            crop = image.crop(pixel_box)
+    except (OSError, ValueError):
+        return None
+
+    crop_width, crop_height = crop.size
+    if crop_width < 3 or crop_height < 3:
+        return None
+    pixels = crop.load()
+    red_mask = [
+        [
+            pixels[x, y][0] >= 85
+            and pixels[x, y][0] - pixels[x, y][1] >= 18
+            and pixels[x, y][0] - pixels[x, y][2] >= 12
+            for x in range(crop_width)
+        ]
+        for y in range(crop_height)
+    ]
+
+    seen: set[tuple[int, int]] = set()
+    components: list[list[tuple[int, int]]] = []
+    for y in range(crop_height):
+        for x in range(crop_width):
+            if not red_mask[y][x] or (x, y) in seen:
+                continue
+            component: list[tuple[int, int]] = []
+            stack = [(x, y)]
+            seen.add((x, y))
+            while stack:
+                px, py = stack.pop()
+                component.append((px, py))
+                for dx, dy in ((-1, -1), (0, -1), (1, -1), (-1, 0), (1, 0), (-1, 1), (0, 1), (1, 1)):
+                    nx, ny = px + dx, py + dy
+                    if not (0 <= nx < crop_width and 0 <= ny < crop_height):
+                        continue
+                    if not red_mask[ny][nx] or (nx, ny) in seen:
+                        continue
+                    seen.add((nx, ny))
+                    stack.append((nx, ny))
+            if len(component) >= 6:
+                components.append(component)
+    if not components:
+        return None
+
+    # THS right-aligns numeric cells, so the glyph is not necessarily below the
+    # header centre.  Requiring exactly one glyph prevents a wider accidental
+    # crop from treating the trailing zero of a multi-digit quantity as zero.
+    if len(components) != 1:
+        return None
+    component = components[0]
+    min_x = min(point[0] for point in component)
+    max_x = max(point[0] for point in component)
+    min_y = min(point[1] for point in component)
+    max_y = max(point[1] for point in component)
+    glyph_width = max_x - min_x + 1
+    glyph_height = max_y - min_y + 1
+    aspect_ratio = glyph_width / glyph_height
+    fill_ratio = len(component) / (glyph_width * glyph_height)
+    if not (3 <= glyph_width <= crop_width * 0.7 and 5 <= glyph_height <= crop_height * 0.95):
+        return None
+    if not (0.30 <= aspect_ratio <= 1.35 and 0.10 <= fill_ratio <= 0.70):
+        return None
+
+    glyph_mask = [
+        [red_mask[y][x] for x in range(min_x, max_x + 1)]
+        for y in range(min_y, max_y + 1)
+    ]
+    if not _component_has_single_hole(glyph_mask):
+        return None
+    return {
+        "method": "anchored_red_zero_glyph",
+        "header": header_label,
+        "normalized_cell": [round(left, 6), round(bottom, 6), round(right, 6), round(top, 6)],
+        "glyph_pixels": len(component),
+    }
+
+
 def normalize_ocr_text(items: list[OcrText]) -> list[OcrText]:
     return sorted(items, key=lambda item: (-item.y, item.x))
 
@@ -442,7 +610,12 @@ def column_values(items: list[OcrText], labels: list[str], *, max_dx: float = 0.
     return [value for _, value in values]
 
 
-def parse_position(raw_text: str, symbol: str, items: list[OcrText]) -> dict[str, Any] | None:
+def parse_position(
+    raw_text: str,
+    symbol: str,
+    items: list[OcrText],
+    image_path: Path | None = None,
+) -> dict[str, Any] | None:
     if symbol not in raw_text:
         return None
     symbol_items = [item for item in items if symbol in item.text]
@@ -500,6 +673,16 @@ def parse_position(raw_text: str, symbol: str, items: list[OcrText]) -> dict[str
     actual_quantity = value_below_header(items, ["实际数量"], row_symbol_y=symbol_y)
     stock_balance = value_below_header(items, ["股票余额"], row_symbol_y=symbol_y)
     available_quantity = value_below_header(items, ["可用余额"], row_symbol_y=symbol_y)
+    available_zero_evidence = None
+    if available_quantity is None and image_path is not None:
+        available_zero_evidence = detect_zero_in_holdings_cell(
+            image_path,
+            items,
+            header_label="可用余额",
+            row_symbol_y=symbol_y,
+        )
+        if available_zero_evidence is not None:
+            available_quantity = 0.0
     avg_cost = value_below_header(items, ["成本价"], row_symbol_y=symbol_y)
     current_price = value_below_header(items, ["市价"], row_symbol_y=symbol_y)
     profit_loss = value_below_header(items, ["盈亏"], row_symbol_y=symbol_y)
@@ -510,9 +693,9 @@ def parse_position(raw_text: str, symbol: str, items: list[OcrText]) -> dict[str
     if available_quantity is not None:
         position["sellable_quantity"] = int(available_quantity)
         position["available_quantity"] = int(available_quantity)
-    elif stock_balance is not None:
-        position["sellable_quantity"] = int(stock_balance)
-        position["available_quantity"] = int(stock_balance)
+        if available_zero_evidence is not None:
+            position["sellable_quantity_source"] = "screenshot_cell_zero"
+            position["sellable_quantity_evidence"] = available_zero_evidence
     if avg_cost is not None:
         position["avg_cost"] = avg_cost
     if current_price is not None:
@@ -522,7 +705,9 @@ def parse_position(raw_text: str, symbol: str, items: list[OcrText]) -> dict[str
 
     average_match = re.search(r"均价[:：]\s*(\d+(?:\.\d+)?)", raw_text)
     latest_match = re.search(r"最新[:：]\s*(\d+(?:\.\d+)?)", raw_text)
-    if average_match:
+    # Prefer the target holding row's 成本价.  The full window can also contain
+    # a chart-level "均价", which is not the account position cost basis.
+    if average_match and "avg_cost" not in position:
         position["avg_cost"] = float(average_match.group(1))
     if latest_match and "current_price" not in position:
         position["current_price"] = float(latest_match.group(1))
@@ -592,32 +777,32 @@ def build_snapshot(
 ) -> dict[str, Any]:
     ordered = normalize_ocr_text(items)
     raw_text = " || ".join(item.text for item in ordered)
-    total_assets = (
-        value_right_of_label(ordered, ["总资产"], max_value_x=0.22)
-        or value_below_label(ordered, ["总资产"], min_label_y=0.75)
-        or number_after_label(raw_text, ["总资产"])
+    total_assets = first_present(
+        value_right_of_label(ordered, ["总资产"], max_value_x=0.22),
+        value_below_label(ordered, ["总资产"], min_label_y=0.75),
+        number_after_label(raw_text, ["总资产"]),
     )
-    available_cash = (
-        value_right_of_label(ordered, ["可用金额", "可用资金", "可用"], max_value_x=0.22)
-        or value_below_label(ordered, ["可用金额", "可用资金", "可用"], min_label_y=0.72)
-        or number_after_label(raw_text, ["可用金额", "可用资金", "可用"])
+    available_cash = first_present(
+        value_right_of_label(ordered, ["可用金额", "可用资金", "可用"], max_value_x=0.22),
+        value_below_label(ordered, ["可用金额", "可用资金", "可用"], min_label_y=0.72),
+        number_after_label(raw_text, ["可用金额", "可用资金", "可用"]),
     )
-    cash_balance = (
-        value_right_of_label(ordered, ["资金余额", "余额"], max_value_x=0.22)
-        or value_below_label(ordered, ["资金余额", "余额"])
-        or number_after_label(raw_text, ["资金余额", "余额"])
+    cash_balance = first_present(
+        value_right_of_label(ordered, ["资金余额", "余额"], max_value_x=0.22),
+        value_below_label(ordered, ["资金余额", "余额"]),
+        number_after_label(raw_text, ["资金余额", "余额"]),
     )
-    market_value = (
-        value_right_of_label(ordered, ["总市值"], max_value_x=0.22)
-        or value_below_label(ordered, ["总市值"], min_label_y=0.72)
-        or number_after_label(raw_text, ["总市值"])
+    market_value = first_present(
+        value_right_of_label(ordered, ["总市值"], max_value_x=0.22),
+        value_below_label(ordered, ["总市值"], min_label_y=0.72),
+        number_after_label(raw_text, ["总市值"]),
     )
-    profit_loss = (
-        value_right_of_label(ordered, ["总盈亏"], max_value_x=0.22)
-        or value_below_label(ordered, ["总盈亏"], min_label_y=0.75)
-        or number_after_label(raw_text, ["总盈亏"])
+    profit_loss = first_present(
+        value_right_of_label(ordered, ["总盈亏"], max_value_x=0.22),
+        value_below_label(ordered, ["总盈亏"], min_label_y=0.75),
+        number_after_label(raw_text, ["总盈亏"]),
     )
-    position = parse_position(raw_text, symbol, ordered)
+    position = parse_position(raw_text, symbol, ordered, image_path=image_path)
     if isinstance(market_value, (int, float)) and abs(float(market_value)) <= 0.01:
         position = None
     if (
@@ -640,7 +825,9 @@ def build_snapshot(
         "target_symbol": symbol in raw_text,
     }
     warnings: list[str] = []
-    if total_assets is not None and market_value is not None and (available_cash or cash_balance):
+    if total_assets is not None and market_value is not None and (
+        available_cash is not None or cash_balance is not None
+    ):
         cash = available_cash if available_cash is not None else cash_balance
         assert cash is not None
         if abs(total_assets - cash - market_value) > max(5.0, total_assets * 0.01):
