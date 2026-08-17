@@ -11,7 +11,7 @@
     "initial_cash": 50000
   },
   "risk": {
-    "max_orders_per_day": 10,
+    "max_orders_per_day": 1,
     "require_manual_confirm": true,
     "allowed_symbols": ["588330"]
   },
@@ -20,7 +20,7 @@
     "stage": "sim_run",
     "ths_account_mode": "simulation",
     "live_account_enabled": false,
-    "simulation_allow_repeated_symbol_trades": true,
+    "simulation_allow_repeated_symbol_trades": false,
     "max_live_cash": 50000,
     "small_live_cash": 5000,
     "ths_app_name": "同花顺",
@@ -75,7 +75,6 @@
   },
   "strategy": {
     "type": "trend_pullback",
-    "rising_days": 3,
     "buy_position_targets": [0.5, 0.85, 1.0],
     "max_position_ratio": 1.0,
     "sell_holding_ratio": 0.5,

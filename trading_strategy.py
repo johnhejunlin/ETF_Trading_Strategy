@@ -28,7 +28,6 @@ class TrendPullbackStrategy:
         self.market_data = market_data
         self.portfolio = portfolio
         self.last_diagnostics: dict = {}
-        self.rising_days = int(config["strategy"]["rising_days"])
         self.buy_position_targets = [
             float(ratio) for ratio in config["strategy"].get("buy_position_targets", [0.5, 0.85, 1.0])
         ]
@@ -50,6 +49,12 @@ class TrendPullbackStrategy:
         quantity = int(position["quantity"])
         latest_buy_price = self._latest_buy_price(position)
         self.last_diagnostics = self._trend_diagnostics(candles, quantity, current_price, latest_buy_price)
+        # One completed operation per symbol per trading day, regardless of
+        # direction.  This check must precede sell logic so a same-day buy can
+        # never be followed by a stop-loss/profit-taking sell.
+        if self.portfolio.traded_today(symbol, today):
+            logging.info("%s 今日已交易，买入和卖出均跳过。", symbol)
+            return None
         if quantity > 0:
             sell_signal = self._sell_signal(
                 symbol,
@@ -62,10 +67,6 @@ class TrendPullbackStrategy:
             )
             if sell_signal:
                 return sell_signal
-
-        if self.portfolio.traded_today(symbol, today):
-            logging.info("%s 今日已交易，跳过。", symbol)
-            return None
 
         buy_target = self._buy_target(candles, quantity, current_price, latest_buy_price)
         if buy_target:
@@ -97,7 +98,7 @@ class TrendPullbackStrategy:
         latest_buy_price: Optional[float],
     ) -> dict:
         closes = [c.close for c in candles]
-        first_buy_rising = self._rising_through_today(closes, previous_days=2)
+        first_buy_rising = self._rising_through_today(closes)
         ma5 = self._ma(closes, 5)
         ma10 = self._ma(closes, 10)
         ma20 = self._ma(closes, 20)
@@ -136,7 +137,7 @@ class TrendPullbackStrategy:
         first_target, second_target, final_target = self.buy_position_targets
         if quantity == 0:
             if first_buy_rising and first_buy_ma:
-                return first_target, "空仓，前两天上涨且当天上涨且 MA5>MA10>MA20"
+                return first_target, "空仓，今天>昨天>前天且 MA5>MA10>MA20"
             return None
         if position_ratio >= second_target:
             if position_ratio < final_target and add_buy_ma and price_above_latest_buy:
@@ -253,6 +254,5 @@ class TrendPullbackStrategy:
         return sum(values[-window:]) / window
 
     @staticmethod
-    def _rising_through_today(values: list[float], previous_days: int) -> bool:
-        comparisons = previous_days + 1
-        return all(values[-idx] > values[-idx - 1] for idx in range(1, comparisons + 1))
+    def _rising_through_today(values: list[float]) -> bool:
+        return len(values) >= 3 and values[-1] > values[-2] > values[-3]

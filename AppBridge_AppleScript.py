@@ -981,6 +981,37 @@ def submission_record_matches(
     return all(marker in text for marker in [page_marker, action, symbol, str(quantity)])
 
 
+def verified_trade_fill_price(items: list[OcrText], *, symbol: str) -> float | None:
+    """Read 成交均价 from the verified target-symbol row on the trades page."""
+    headers = [item for item in items if item.text.replace(" ", "") == "成交均价"]
+    symbol_items = [item for item in items if symbol in item.text]
+    if not headers or not symbol_items:
+        return None
+    candidates: list[tuple[float, float]] = []
+    for header in headers:
+        header_x = header.x + header.width / 2
+        row_items = [
+            item
+            for item in symbol_items
+            if 0 < header.y - item.y <= 0.06
+        ]
+        for row_item in row_items:
+            for item in items:
+                text = item.text.replace(",", "").replace("，", "").strip()
+                if not re.fullmatch(r"\d+(?:\.\d+)?", text):
+                    continue
+                item_x = item.x + item.width / 2
+                if abs(item.y - row_item.y) > 0.018 or abs(item_x - header_x) > 0.035:
+                    continue
+                value = float(text)
+                if value > 0:
+                    candidates.append((abs(item_x - header_x) + abs(item.y - row_item.y), value))
+    if not candidates:
+        return None
+    candidates.sort(key=lambda pair: pair[0])
+    return candidates[0][1]
+
+
 def is_trade_page(items: list[OcrText]) -> bool:
     text = raw_text(items)
     # The home-page news feed regularly contains words such as 大笔买入/卖出
@@ -1617,6 +1648,7 @@ def run_order(
     trade_path: str | None = None
     order_record_verified = False
     trade_record_verified = False
+    fill_price: float | None = None
     submission_evidence: list[str] = []
     if submit:
         confirmation_targets = ["确认", f"确认{action}", f"确定{action}"]
@@ -1712,11 +1744,13 @@ def run_order(
             )
             if trade_record_verified:
                 submission_evidence.append("trades")
+                fill_price = verified_trade_fill_price(trade_items, symbol=symbol)
             steps.append(
                 {
                     "label": "verify_trades",
                     "screenshot_path": trade_path,
                     "matched": trade_record_verified,
+                    "fill_price": fill_price,
                     "table_text": order_table_text(trade_items),
                 }
             )
@@ -1731,6 +1765,7 @@ def run_order(
         "side": side,
         "quantity": quantity,
         "limit_price": limit_price,
+        "fill_price": fill_price,
         "sellable_quantity": verified_sellable_quantity,
         "submitted": submitted,
         "screenshot_path": receipt_path or str(image_path),

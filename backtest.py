@@ -438,12 +438,12 @@ def normalize_minute_frame(minute: pd.DataFrame) -> pd.DataFrame:
     return result.dropna(subset=["datetime", "close"]).sort_values("datetime").reset_index(drop=True)
 
 
-def prepare_indicators(df: pd.DataFrame, rising_days: int) -> pd.DataFrame:
+def prepare_indicators(df: pd.DataFrame) -> pd.DataFrame:
     result = df.copy()
     for window in [5, 10, 20, 60]:
         result[f"ma{window}"] = result["close"].rolling(window).mean()
 
-    first_buy_rising = rising_through_today(result["close"], previous_days=2)
+    first_buy_rising = rising_through_today(result["close"])
     result["first_buy_rising"] = first_buy_rising
     result["first_buy_condition"] = (
         result["first_buy_rising"]
@@ -456,11 +456,8 @@ def prepare_indicators(df: pd.DataFrame, rising_days: int) -> pd.DataFrame:
     return result
 
 
-def rising_through_today(close: pd.Series, previous_days: int) -> pd.Series:
-    rising = pd.Series(True, index=close.index)
-    for offset in range(previous_days + 1):
-        rising = rising & (close.shift(offset) > close.shift(offset + 1))
-    return rising
+def rising_through_today(close: pd.Series) -> pd.Series:
+    return (close > close.shift(1)) & (close.shift(1) > close.shift(2))
 
 
 def run_backtest(
@@ -1761,7 +1758,7 @@ def main() -> None:
     config = load_config()
     symbol = config["symbols"][0]
     raw = fetch_tencent_daily(symbol, args.start, args.end, refresh_cache=args.refresh_daily_cache)
-    data = prepare_indicators(raw, int(config["strategy"]["rising_days"]))
+    data = prepare_indicators(raw)
     data.attrs.update(raw.attrs)
     minute_prices = load_minute_prices(
         symbol,
