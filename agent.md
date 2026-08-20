@@ -19,6 +19,7 @@
 - `backtest.py`：回测、回测数据处理、回测撮合、指标和报告生成。
 - `portfolio.json`：本地模拟资金和持仓状态，运行时自动创建，不上传 GitHub。
 - `signals.csv`：策略信号输出，运行时自动追加，不上传 GitHub。
+- `TradingLog.csv`：订单生命周期、系统成交和外部/人工交易审计，运行时自动追加，不上传 GitHub。
 - `trading_engine.log`：运行日志，不上传 GitHub。
 - `trading_engine.monitor.log`：后台托管运行时的实时监控日志，不上传 GitHub。
 - `runtime_state.json`：执行阶段和 GUI 模拟结果等运行状态记录，不上传 GitHub。
@@ -46,7 +47,7 @@
 - 回测结果：`backtest_*.html`、`backtest_*.png`、`backtest_trades_*.csv`
 - 本地测试：`tests/`
 - 行情数据库：`market_data.sqlite3`
-- 本地运行状态：`portfolio.json`、`runtime_state.json`、`signals.csv`、`STOP_TRADING`
+- 本地运行状态：`portfolio.json`、`runtime_state.json`、`signals.csv`、`TradingLog.csv`、`STOP_TRADING`
 - 日志：`*.log`
 - GUI 自动化临时产物：`screenshots/*.png`、`screenshots/latest_order_intent.json`、`screenshots/latest_verified_order.json`
 - Python 缓存、虚拟环境和 IDE 配置：`__pycache__/`、`.venv/`、`venv/`、`.idea/`、`.vscode/`

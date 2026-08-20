@@ -18,6 +18,7 @@ from zoneinfo import ZoneInfo
 from market_data import EastMoneyMarketData
 from trading_strategy import OrderSignal, TrendPullbackStrategy
 from AppBridge_OCRPositionCalculation import minimize_app_window_if_safe
+from trading_log import TradingLog, stable_event_id
 
 
 ROOT = Path(__file__).resolve().parent
@@ -27,6 +28,7 @@ LOG_PATH = ROOT / "trading_engine.log"
 STOP_PATH = ROOT / "STOP_TRADING"
 RUN_STATE_PATH = ROOT / "runtime_state.json"
 SIGNAL_AUDIT_PATH = ROOT / "signals.csv"
+TRADING_LOG_PATH = ROOT / "TradingLog.csv"
 SCREENSHOT_DIR = ROOT / "screenshots"
 APPLESCRIPT_BRIDGE_REQUEST_PATH = SCREENSHOT_DIR / "latest_applescript_bridge_request.json"
 SCREENSHOT_CLEANUP_SUFFIXES = {".png", ".json"}
@@ -55,6 +57,7 @@ EXECUTION_MODES = {"dry_run", "manual_confirm", "ths_applescript"}
 EXECUTION_STAGES = {"dry_run", "gui_simulation", "sim_run", "small_live", "full_live"}
 THS_ACCOUNT_MODES = {"simulation", "live"}
 PRE_EXECUTION_ACCOUNT_SYNC_OK = "交易前账户资金/持仓验证完成。"
+PENDING_ORDER_STATUSES = {"SUBMITTED", "PARTIAL", "UNFILLED"}
 
 
 @dataclass(frozen=True)
@@ -135,6 +138,20 @@ class PortfolioStore:
         for date_key in sorted(counts)[:-31]:
             counts.pop(date_key, None)
 
+    def record_strategy_fill(self, symbol: str, side: str) -> None:
+        """Update strategy counters for one order's first non-zero fill."""
+        position = self.position(symbol)
+        if side == "BUY":
+            position["sell_streak"] = 0
+            position["buy_count"] = int(position.get("buy_count") or 0) + 1
+            return
+        if side == "SELL":
+            position["sell_streak"] = int(position.get("sell_streak") or 0) + 1
+
+    def record_external_fill(self, symbol: str, side: str) -> None:
+        if side == "BUY":
+            self.position(symbol)["sell_streak"] = 0
+
     def sync_account_snapshot(self, snapshot: dict, symbols: list[str]) -> None:
         available_cash = snapshot.get("available_cash")
         if available_cash is None:
@@ -155,10 +172,6 @@ class PortfolioStore:
             for position in snapshot.get("positions", [])
             if position.get("symbol")
         ]
-        if not positions_by_symbol:
-            self.data["last_account_snapshot"] = self._snapshot_summary(snapshot)
-            return
-
         for symbol in sorted(set(symbols) | set(positions_by_symbol)):
             local = self.position(symbol)
             account_position = positions_by_symbol.get(symbol)
@@ -356,6 +369,40 @@ class RuntimeState:
         self.save()
         return value
 
+    def pending_orders(self) -> dict[str, dict]:
+        orders = self.data.setdefault("pending_orders", {})
+        return orders if isinstance(orders, dict) else {}
+
+    def pending_order_for_symbol(self, symbol: str) -> Optional[dict]:
+        for order in self.pending_orders().values():
+            if order.get("symbol") == symbol and order.get("status") in PENDING_ORDER_STATUSES:
+                return order
+        return None
+
+    def put_pending_order(self, order: dict) -> None:
+        self.pending_orders()[str(order["order_id"])] = order
+        self.save()
+
+    def update_pending_order(self, order_id: str, **updates: object) -> Optional[dict]:
+        order = self.pending_orders().get(order_id)
+        if order is None:
+            return None
+        order.update(updates)
+        self.save()
+        return order
+
+    def fill_effect_recorded(self, order_id: str) -> bool:
+        return order_id in set(self.data.get("fill_effect_order_ids", []))
+
+    def record_fill_effect(self, order_id: str) -> bool:
+        ids = list(self.data.get("fill_effect_order_ids", []))
+        if order_id in ids:
+            return False
+        ids.append(order_id)
+        self.data["fill_effect_order_ids"] = ids[-500:]
+        self.save()
+        return True
+
     def save(self) -> None:
         with self.path.open("w", encoding="utf-8") as handle:
             json.dump(self.data, handle, ensure_ascii=False, indent=2)
@@ -393,12 +440,13 @@ class Notifier:
 
 
 class RiskManager:
-    def __init__(self, config: dict, clock: TradingClock) -> None:
+    def __init__(self, config: dict, clock: TradingClock, runtime_state: Optional[RuntimeState] = None) -> None:
         self.config = config
         self.clock = clock
         self.risk = config.get("risk", {})
         self.execution = config.get("execution", {})
         self.runtime = config.get("runtime", {})
+        self.runtime_state = runtime_state
 
     def validate_order(
         self,
@@ -424,6 +472,14 @@ class RiskManager:
             return RiskDecision(False, "当前不在配置交易时段内，禁止下单。")
         if portfolio.traded_today(signal.symbol, today):
             return RiskDecision(False, f"{signal.symbol} 今日已执行过交易，买入和卖出均被禁止。")
+        if self.runtime_state is not None:
+            pending = self.runtime_state.pending_order_for_symbol(signal.symbol)
+            if pending:
+                return RiskDecision(
+                    False,
+                    f"{signal.symbol} 存在待人工处理订单 {pending.get('order_id')} "
+                    f"({pending.get('status')})，禁止重复提交。",
+                )
 
         position = portfolio.position(signal.symbol)
         if signal.side == "SELL" and signal.quantity > int(position.get("quantity") or 0):
@@ -561,6 +617,16 @@ class ThsAppleScriptExecutor(Executor):
                     submitted_at=submitted_at,
                     verified_fields=fields,
                     screenshot_path=str(screenshot_path) if screenshot_path else None,
+                )
+        if signal.side == "SELL":
+            executed_quantity = int(fields.get("quantity", signal.quantity))
+            if executed_quantity != signal.quantity:
+                logging.info(
+                    "最终卖出数量已按账户可卖数量调整: strategy_quantity=%s "
+                    "sellable_quantity=%s execution_quantity=%s",
+                    signal.quantity,
+                    fields.get("sellable_quantity"),
+                    executed_quantity,
                 )
 
         if self.stage == "gui_simulation" or not self.final_confirm_enabled:
@@ -782,18 +848,23 @@ class ThsAppleScriptExecutor(Executor):
             return False, f"同花顺账户模式不匹配: {fields.get('account_mode') or fields.get('trade_mode')}"
         try:
             quantity = int(fields.get("quantity"))
+            requested_quantity = int(fields.get("requested_quantity", signal.quantity))
             price = float(fields.get("limit_price"))
         except (TypeError, ValueError):
             return False, "数量或价格字段无法解析。"
-        if quantity != signal.quantity:
-            return False, f"数量不匹配: {quantity}"
+        if requested_quantity != signal.quantity:
+            return False, f"策略请求数量不匹配: {requested_quantity} != {signal.quantity}"
+        expected_quantity = signal.quantity
         if signal.side == "SELL":
             try:
                 sellable_quantity = int(fields.get("sellable_quantity"))
             except (TypeError, ValueError):
                 return False, "卖出订单未提供可解析的可卖数量。"
-            if signal.quantity > sellable_quantity:
-                return False, f"卖出数量 {signal.quantity} 超过界面可卖数量 {sellable_quantity}。"
+            if sellable_quantity <= 0:
+                return False, f"界面可卖数量必须大于 0: {sellable_quantity}。"
+            expected_quantity = min(signal.quantity, sellable_quantity)
+        if quantity != expected_quantity:
+            return False, f"实际下单数量不匹配: {quantity} != {expected_quantity}"
         expected_price = float(signal.limit_price or 0.0)
         if abs(price - expected_price) > self.price_tolerance:
             return False, f"价格不匹配: {price} != {expected_price}"
@@ -894,6 +965,13 @@ def sync_portfolio_from_account(
     if snapshot.get("available_cash") is None and snapshot.get("cash_balance") is None:
         return False, "同花顺账户快照缺少可用资金/资金余额。"
 
+    reconcile_account_changes(
+        config,
+        portfolio,
+        runtime_state,
+        snapshot,
+        TradingLog(TRADING_LOG_PATH),
+    )
     portfolio.sync_account_snapshot(snapshot, config["symbols"])
     portfolio.save()
     runtime_state.record_event("last_account_snapshot", portfolio.data.get("last_account_snapshot", {}))
@@ -1374,6 +1452,7 @@ def log_cycle_summary(symbol: str, quote, portfolio: PortfolioStore, diagnostics
     ma20 = float(diagnostics.get("ma20") or 0.0)
     ma60 = float(diagnostics.get("ma60") or 0.0)
     latest_buy_price_text = f"{latest_buy_price:.4f}" if latest_buy_price is not None else "N/A"
+    trading_condition = str(diagnostics.get("trading_block_reason") or signal_condition_text(signal))
 
     logging.info(
         "\n" + "\n".join([
@@ -1394,7 +1473,7 @@ def log_cycle_summary(symbol: str, quote, portfolio: PortfolioStore, diagnostics
                 f"(MA20={ma20:.4f}) {format_relation(ma20, ma60)} "
                 f"(MA60={ma60:.4f})"
             ),
-            f"交易条件：{signal_condition_text(signal)}",
+            f"交易条件：{trading_condition}",
             LOG_SEPARATOR,
         ])
     )
@@ -1504,6 +1583,22 @@ def print_status() -> None:
             print(f"  {process}")
     else:
         print("正在运行的交易引擎进程: 未发现")
+    runtime_state = RuntimeState(RUN_STATE_PATH)
+    pending_orders = [
+        order
+        for order in runtime_state.pending_orders().values()
+        if order.get("status") in PENDING_ORDER_STATUSES
+    ]
+    if pending_orders:
+        print("待人工处理订单:")
+        for order in pending_orders:
+            print(
+                f"  {order.get('order_id')} {order.get('side')} {order.get('symbol')} "
+                f"已成交={order.get('executed_quantity', 0)} "
+                f"剩余={order.get('remaining_quantity', 0)} 状态={order.get('status')}"
+            )
+    else:
+        print("待人工处理订单: 无")
     print(f"日志文件: {LOG_PATH}")
     lines = latest_log_lines()
     if lines:
@@ -1616,6 +1711,399 @@ def verified_execution_fill_price(
     return (price, "verified_trade_fill") if price > 0 else (None, None)
 
 
+def make_order_id(signal: OrderSignal, result: ExecutionResult) -> str:
+    contract_id = str(result.verified_fields.get("contract_id") or "").strip()
+    if contract_id:
+        return f"THS-{contract_id}"
+    return "ORD-" + stable_event_id(
+        result.submitted_at,
+        signal.symbol,
+        signal.side,
+        signal.quantity,
+        signal.limit_price,
+    )
+
+
+def order_evidence_path(result: ExecutionResult) -> str:
+    fields = result.verified_fields if isinstance(result.verified_fields, dict) else {}
+    paths = [
+        result.screenshot_path,
+        fields.get("trade_screenshot_path"),
+        fields.get("order_screenshot_path"),
+        fields.get("receipt_screenshot_path"),
+        fields.get("screenshot_path"),
+    ]
+    return " | ".join(dict.fromkeys(str(path) for path in paths if path))
+
+
+def append_order_event(
+    trading_log: TradingLog,
+    *,
+    order: dict,
+    status: str,
+    event_type: str,
+    executed_quantity: int = 0,
+    trade_price: Optional[float] = None,
+    price_source: str = "",
+    confidence: str = "HIGH",
+    note: str = "",
+    event_time: Optional[str] = None,
+    pre_quantity: Optional[int] = None,
+    post_quantity: Optional[int] = None,
+) -> bool:
+    order_id = str(order.get("order_id") or "")
+    cumulative = int(order.get("executed_quantity") or 0)
+    event_id = stable_event_id(order_id, status, cumulative, executed_quantity, event_time or order.get("last_checked_at"))
+    return trading_log.append(
+        {
+            "event_id": event_id,
+            "event_time": event_time or order.get("last_checked_at") or datetime.now().isoformat(timespec="seconds"),
+            "event_type": event_type,
+            "order_status": status,
+            "order_id": order_id,
+            "contract_id": order.get("contract_id", ""),
+            "source": order.get("source", "SYSTEM"),
+            "symbol": order.get("symbol", ""),
+            "name": order.get("name", ""),
+            "side": order.get("side", ""),
+            "requested_quantity": order.get("requested_quantity", ""),
+            "executed_quantity": executed_quantity,
+            "remaining_quantity": order.get("remaining_quantity", ""),
+            "limit_price": order.get("limit_price", ""),
+            "trade_price": trade_price if trade_price is not None else "",
+            "price_source": price_source,
+            "trigger_condition": order.get("trigger_condition", ""),
+            "pre_quantity": order.get("pre_quantity", "") if pre_quantity is None else pre_quantity,
+            "post_quantity": order.get("last_observed_quantity", "") if post_quantity is None else post_quantity,
+            "confidence": confidence,
+            "evidence_path": order.get("evidence_path", ""),
+            "note": note,
+        }
+    )
+
+
+def register_submitted_order(
+    signal: OrderSignal,
+    result: ExecutionResult,
+    portfolio: PortfolioStore,
+    runtime_state: RuntimeState,
+    trading_log: TradingLog,
+) -> dict:
+    fields = result.verified_fields if isinstance(result.verified_fields, dict) else {}
+    requested_quantity = int(fields.get("quantity", signal.quantity))
+    order_id = make_order_id(signal, result)
+    order = {
+        "order_id": order_id,
+        "signal_id": stable_event_id(signal.symbol, signal.side, signal.quantity, signal.note, result.submitted_at),
+        "contract_id": str(fields.get("contract_id") or ""),
+        "source": "SYSTEM",
+        "symbol": signal.symbol,
+        "name": portfolio.position(signal.symbol).get("name", ""),
+        "side": signal.side,
+        "requested_quantity": requested_quantity,
+        "executed_quantity": 0,
+        "remaining_quantity": requested_quantity,
+        "limit_price": signal.limit_price,
+        "trigger_condition": signal.note,
+        "submitted_at": result.submitted_at,
+        "last_checked_at": result.submitted_at,
+        "status": "SUBMITTED",
+        "pre_quantity": int(portfolio.position(signal.symbol).get("quantity") or 0),
+        "last_observed_quantity": int(portfolio.position(signal.symbol).get("quantity") or 0),
+        "pre_cash": portfolio.cash(),
+        "evidence_path": order_evidence_path(result),
+        "alerted_at": None,
+    }
+    runtime_state.put_pending_order(order)
+    append_order_event(
+        trading_log,
+        order=order,
+        status="SUBMITTED",
+        event_type="ORDER_SUBMITTED",
+        note="订单已提交，尚未确认成交；不计入今日交易次数。",
+        event_time=result.submitted_at,
+    )
+    return order
+
+
+def record_confirmed_system_fill(
+    order: dict,
+    executed_quantity: int,
+    portfolio: PortfolioStore,
+    runtime_state: RuntimeState,
+    trading_log: TradingLog,
+    *,
+    trade_price: Optional[float],
+    price_source: str,
+    confidence: str,
+    event_time: Optional[str] = None,
+    update_position: bool = False,
+) -> str:
+    if executed_quantity <= 0:
+        return str(order.get("status") or "UNFILLED")
+    order_id = str(order["order_id"])
+    previous_status = str(order.get("status") or "SUBMITTED")
+    previous_executed = int(order.get("executed_quantity") or 0)
+    cumulative = min(int(order["requested_quantity"]), previous_executed + executed_quantity)
+    newly_executed = cumulative - previous_executed
+    if newly_executed <= 0:
+        return str(order.get("status") or "FILLED")
+
+    if update_position and trade_price is not None:
+        signal = OrderSignal(
+            str(order["symbol"]),
+            str(order["side"]),
+            newly_executed,
+            float(order.get("limit_price") or 0),
+            str(order.get("trigger_condition") or ""),
+        )
+        portfolio.apply_fill(signal, trade_price, price_source=price_source)
+    if runtime_state.record_fill_effect(order_id):
+        if not update_position:
+            portfolio.record_strategy_fill(str(order["symbol"]), str(order["side"]))
+        trade_date = str(event_time or datetime.now().isoformat(timespec="seconds"))[:10]
+        portfolio.mark_trade(str(order["symbol"]), trade_date)
+
+    remaining = max(0, int(order["requested_quantity"]) - cumulative)
+    status = "FILLED" if remaining == 0 else "PARTIAL"
+    checked_at = event_time or datetime.now().isoformat(timespec="seconds")
+    order.update(
+        {
+            "executed_quantity": cumulative,
+            "remaining_quantity": remaining,
+            "status": status,
+            "last_checked_at": checked_at,
+        }
+    )
+    runtime_state.put_pending_order(order)
+    if previous_status == "UNFILLED":
+        fill_note = "此前未成交的待处理系统订单后来发生成交，请复核是否属于延迟或意外成交。"
+    elif status == "PARTIAL":
+        fill_note = "系统订单部分成交，剩余数量继续人工跟踪。"
+    else:
+        fill_note = "系统订单已确认成交。"
+    append_order_event(
+        trading_log,
+        order=order,
+        status=status,
+        event_type="SYSTEM_FILL",
+        executed_quantity=newly_executed,
+        trade_price=trade_price,
+        price_source=price_source,
+        confidence=confidence,
+        note=fill_note,
+        event_time=checked_at,
+    )
+    portfolio.save()
+    return status
+
+
+def _snapshot_position(snapshot: dict, symbol: str) -> dict:
+    for position in snapshot.get("positions", []):
+        if str(position.get("symbol") or "") == symbol:
+            return position
+    return {}
+
+
+def _estimated_trade_price(
+    side: str,
+    quantity: int,
+    old_cash: float,
+    snapshot: dict,
+    account_position: dict,
+) -> tuple[Optional[float], str, str]:
+    if quantity <= 0:
+        return None, "", "LOW"
+    if side == "BUY":
+        try:
+            avg_cost = float(account_position.get("avg_cost") or 0)
+        except (TypeError, ValueError):
+            avg_cost = 0
+        if avg_cost > 0:
+            return avg_cost, "ACCOUNT_AVG_COST_ESTIMATED", "MEDIUM"
+    new_cash = snapshot.get("available_cash")
+    if new_cash is None:
+        new_cash = snapshot.get("cash_balance")
+    try:
+        cash_delta = float(new_cash) - float(old_cash)
+    except (TypeError, ValueError):
+        cash_delta = 0
+    if side == "SELL" and cash_delta > 0:
+        return cash_delta / quantity, "ACCOUNT_CASH_DELTA_ESTIMATED", "LOW"
+    return None, "UNAVAILABLE", "LOW"
+
+
+def _pending_alert_due(order: dict, now: datetime, interval_minutes: int) -> bool:
+    alerted_at = order.get("alerted_at")
+    if not alerted_at:
+        return True
+    try:
+        previous = datetime.fromisoformat(str(alerted_at))
+    except ValueError:
+        return True
+    if previous.tzinfo is None and now.tzinfo is not None:
+        previous = previous.replace(tzinfo=now.tzinfo)
+    return (now - previous).total_seconds() >= interval_minutes * 60
+
+
+def reconcile_account_changes(
+    config: dict,
+    portfolio: PortfolioStore,
+    runtime_state: RuntimeState,
+    snapshot: dict,
+    trading_log: TradingLog,
+    notifier: Optional[Notifier] = None,
+) -> list[dict]:
+    """Match account quantity deltas to pending system orders or log them as external."""
+    notifier = notifier or Notifier(config)
+    now = datetime.now(ZoneInfo(config.get("timezone", "Asia/Shanghai")))
+    event_time = str(snapshot.get("created_at") or now.isoformat(timespec="seconds"))
+    initialized = bool(runtime_state.data.get("account_reconciliation_initialized"))
+    old_cash = portfolio.cash()
+    events: list[dict] = []
+
+    for symbol in config.get("symbols", []):
+        account_position = _snapshot_position(snapshot, symbol)
+        old_quantity = int(portfolio.position(symbol).get("quantity") or 0)
+        new_quantity = int(account_position.get("quantity") or 0)
+        delta = new_quantity - old_quantity
+        pending = runtime_state.pending_order_for_symbol(symbol)
+
+        if delta and pending:
+            side = "BUY" if delta > 0 else "SELL"
+            remaining = int(pending.get("remaining_quantity") or 0)
+            if side == pending.get("side") and abs(delta) <= remaining:
+                price, price_source, confidence = _estimated_trade_price(
+                    side, abs(delta), old_cash, snapshot, account_position
+                )
+                pending["last_observed_quantity"] = new_quantity
+                status = record_confirmed_system_fill(
+                    pending,
+                    abs(delta),
+                    portfolio,
+                    runtime_state,
+                    trading_log,
+                    trade_price=price,
+                    price_source=price_source,
+                    confidence=confidence,
+                    event_time=event_time,
+                    update_position=False,
+                )
+                events.append({"source": "SYSTEM", "symbol": symbol, "side": side, "quantity": abs(delta), "status": status})
+                logging.info(
+                    "账户持仓变化已匹配系统订单: order_id=%s side=%s quantity=%s status=%s",
+                    pending.get("order_id"), side, abs(delta), status,
+                )
+                continue
+
+        if delta and initialized:
+            side = "BUY" if delta > 0 else "SELL"
+            quantity = abs(delta)
+            price, price_source, confidence = _estimated_trade_price(
+                side, quantity, old_cash, snapshot, account_position
+            )
+            external_order = {
+                "order_id": "EXT-" + stable_event_id(event_time, symbol, side, quantity, old_quantity, new_quantity),
+                "source": "EXTERNAL_OR_MANUAL",
+                "symbol": symbol,
+                "name": account_position.get("name") or portfolio.position(symbol).get("name", ""),
+                "side": side,
+                "requested_quantity": quantity,
+                "executed_quantity": quantity,
+                "remaining_quantity": 0,
+                "limit_price": "",
+                "trigger_condition": "非系统信号；账户持仓变化无法匹配待处理系统订单",
+                "pre_quantity": old_quantity,
+                "last_observed_quantity": new_quantity,
+                "last_checked_at": event_time,
+                "status": "FILLED",
+                "evidence_path": str(config.get("execution", {}).get("account_snapshot_path", "")),
+            }
+            portfolio.record_external_fill(symbol, side)
+            portfolio.mark_trade(symbol, event_time[:10])
+            append_order_event(
+                trading_log,
+                order=external_order,
+                status="FILLED",
+                event_type="EXTERNAL_FILL",
+                executed_quantity=quantity,
+                trade_price=price,
+                price_source=price_source,
+                confidence=confidence,
+                note="无法匹配的账户变化；可能为人工或系统外交易，仅跟踪和预警。",
+                event_time=event_time,
+                pre_quantity=old_quantity,
+                post_quantity=new_quantity,
+            )
+            message = f"{symbol} 检测到未匹配账户变化: {side} {quantity}，仅记录和预警。"
+            logging.warning(message)
+            notifier.notify("AI Stock 检测到系统外交易", message)
+            events.append({"source": "EXTERNAL_OR_MANUAL", "symbol": symbol, "side": side, "quantity": quantity, "status": "FILLED"})
+            continue
+
+        if pending:
+            previous_status = str(pending.get("status") or "SUBMITTED")
+            pending.update(
+                {
+                    "status": "UNFILLED" if previous_status == "SUBMITTED" else previous_status,
+                    "last_checked_at": event_time,
+                    "last_observed_quantity": new_quantity,
+                }
+            )
+            runtime_state.put_pending_order(pending)
+            if previous_status == "SUBMITTED":
+                append_order_event(
+                    trading_log,
+                    order=pending,
+                    status="UNFILLED",
+                    event_type="ORDER_STATUS",
+                    note="账户持仓未发生匹配变化，订单保持待人工处理；不自动撤单或重试。",
+                    event_time=event_time,
+                )
+            interval = int(config.get("runtime", {}).get("pending_order_alert_interval_minutes", 30))
+            if _pending_alert_due(pending, now, interval):
+                message = (
+                    f"{symbol} 订单 {pending.get('order_id')} 仍为 {pending.get('status')}，"
+                    "请人工检查委托/成交并决定是否撤单。系统不会自动撤单或重试。"
+                )
+                logging.warning(message)
+                notifier.notify("AI Stock 待处理订单预警", message)
+                pending["alerted_at"] = now.isoformat(timespec="seconds")
+                runtime_state.put_pending_order(pending)
+
+    runtime_state.record_event("account_reconciliation_initialized", True)
+    return events
+
+
+def resolve_pending_order(
+    order_id: str,
+    status: str,
+    note: str,
+    runtime_state: RuntimeState,
+    trading_log: TradingLog,
+) -> dict:
+    if status not in {"CANCELLED", "REJECTED"}:
+        raise ValueError("人工处理只允许标记为 CANCELLED 或 REJECTED；成交必须由成交记录或账户变化确认。")
+    order = runtime_state.pending_orders().get(order_id)
+    if order is None:
+        raise ValueError(f"未找到待处理订单: {order_id}")
+    if order.get("status") not in PENDING_ORDER_STATUSES:
+        raise ValueError(f"订单 {order_id} 当前状态为 {order.get('status')}，不是待处理订单。")
+    resolved_at = datetime.now().isoformat(timespec="seconds")
+    order.update({"status": status, "last_checked_at": resolved_at})
+    runtime_state.put_pending_order(order)
+    append_order_event(
+        trading_log,
+        order=order,
+        status=status,
+        event_type="MANUAL_RESOLUTION",
+        note=note or "用户核对券商委托记录后手工关闭待处理订单。",
+        event_time=resolved_at,
+        confidence="HIGH",
+    )
+    return order
+
+
 def run_once(
     config: dict,
     ignore_hours: bool = False,
@@ -1625,9 +2113,10 @@ def run_once(
 ) -> None:
     clock = TradingClock(config["timezone"], config["trading_sessions"])
     notifier = Notifier(config)
-    risk_manager = RiskManager(config, clock)
     portfolio = PortfolioStore(PORTFOLIO_PATH, config["symbols"], float(config["portfolio"]["initial_cash"]))
     runtime_state = RuntimeState(RUN_STATE_PATH)
+    risk_manager = RiskManager(config, clock, runtime_state)
+    trading_log = TradingLog(TRADING_LOG_PATH)
     if sync_account_at_start:
         ok, sync_message = sync_portfolio_from_account(config, portfolio, runtime_state, reason="run_once_start")
         if not ok:
@@ -1653,13 +2142,6 @@ def run_once(
     executor = build_executor(config)
 
     for symbol in config["symbols"]:
-        if portfolio.daily_order_count(today) >= 1:
-            logging.info("今日已执行过一次交易，所有买入和卖出操作均跳过。")
-            break
-        if portfolio.traded_today(symbol, today):
-            logging.info("%s 今日已执行过交易，买入和卖出操作均跳过。", symbol)
-            continue
-
         try:
             quote = market_data.latest_quote(symbol)
         except RuntimeError as exc:
@@ -1678,6 +2160,20 @@ def run_once(
             portfolio.save()
             continue
         log_cycle_summary(symbol, quote, portfolio, strategy.last_diagnostics, signal)
+        if portfolio.daily_order_count(today) >= 1:
+            logging.info("今日已执行过一次交易：继续播报行情和策略诊断，但所有买入和卖出操作均跳过。")
+            portfolio.save()
+            continue
+        pending = runtime_state.pending_order_for_symbol(symbol)
+        if pending:
+            logging.warning(
+                "%s 存在待人工处理订单 %s (%s)，继续行情监控但禁止重复下单。",
+                symbol,
+                pending.get("order_id"),
+                pending.get("status"),
+            )
+            portfolio.save()
+            continue
         if not signal:
             portfolio.save()
             continue
@@ -1745,6 +2241,32 @@ def run_once(
 
         audit_signal(signal, result, decision)
         runtime_state.record_event("last_execution_result", asdict(result))
+        order_id = make_order_id(signal, result)
+        lifecycle_order = {
+            "order_id": order_id,
+            "contract_id": str(result.verified_fields.get("contract_id") or "") if isinstance(result.verified_fields, dict) else "",
+            "source": "SYSTEM",
+            "symbol": signal.symbol,
+            "name": portfolio.position(signal.symbol).get("name", ""),
+            "side": signal.side,
+            "requested_quantity": signal.quantity,
+            "executed_quantity": 0,
+            "remaining_quantity": signal.quantity,
+            "limit_price": signal.limit_price,
+            "trigger_condition": signal.note,
+            "pre_quantity": int(portfolio.position(signal.symbol).get("quantity") or 0),
+            "last_observed_quantity": int(portfolio.position(signal.symbol).get("quantity") or 0),
+            "last_checked_at": result.submitted_at,
+            "evidence_path": order_evidence_path(result),
+        }
+        append_order_event(
+            trading_log,
+            order=lifecycle_order,
+            status="VALIDATED",
+            event_type="ORDER_VALIDATED",
+            note="风控通过，开始执行器字段校验。",
+            event_time=result.submitted_at,
+        )
         if result.success:
             if result.status == "gui_simulation_verified":
                 runtime_state.increment("gui_simulation_success_count")
@@ -1752,34 +2274,57 @@ def run_once(
                 notifier.notify("AI Stock GUI 模拟通过", f"{result.status}: {result.message}")
                 logging.info("%s GUI 模拟校验通过，未记录为真实成交: %s", symbol, signal)
                 break
+            order = register_submitted_order(signal, result, portfolio, runtime_state, trading_log)
             fill_price, fill_price_source = verified_execution_fill_price(result, signal)
-            if fill_price is not None and fill_price_source is not None:
-                portfolio.apply_fill(signal, fill_price, price_source=fill_price_source)
+            trade_verified = bool(result.verified_fields.get("trade_record_verified")) if isinstance(result.verified_fields, dict) else False
+            if result.status == "dry_run":
+                trade_verified = fill_price is not None
+            if trade_verified and fill_price is not None and fill_price_source is not None:
+                executed_quantity = int(result.verified_fields.get("executed_quantity") or result.verified_fields.get("quantity") or signal.quantity)
+                record_confirmed_system_fill(
+                    order,
+                    executed_quantity,
+                    portfolio,
+                    runtime_state,
+                    trading_log,
+                    trade_price=fill_price,
+                    price_source=fill_price_source,
+                    confidence="HIGH",
+                    event_time=result.submitted_at,
+                    update_position=True,
+                )
                 logging.info(
-                    "%s 使用成交价更新本地持仓: fill_price=%.4f source=%s",
-                    symbol,
-                    fill_price,
-                    fill_price_source,
+                    "%s 已按可验证成交记录更新: quantity=%s fill_price=%.4f source=%s",
+                    symbol, executed_quantity, fill_price, fill_price_source,
                 )
             else:
                 logging.warning(
-                    "%s 已提交但未取得可验证成交均价；不使用委托限价更新成本，等待账户快照同步。",
+                    "%s 订单已提交但尚无非零成交证据；不计入今日交易次数，转入待处理跟踪。",
                     symbol,
                 )
-            portfolio.mark_trade(symbol, today)
             portfolio.save()
-            ok, sync_message = sync_account_after_execution(config, portfolio, runtime_state)
-            if not ok:
-                logging.error("交易后账户资金/持仓验证失败: %s", sync_message)
-                notifier.notify("AI Stock 交易后校验失败", sync_message)
-            else:
-                logging.info("交易后账户资金/持仓验证完成。")
-                minimize_trading_app_if_idle(config, reason="post_trade_verified")
-            notifier.notify("AI Stock 执行成功", f"{result.status}: {result.message}")
-            logging.info("%s 已记录交易状态: %s", symbol, signal)
+            if result.status != "dry_run":
+                ok, sync_message = sync_account_after_execution(config, portfolio, runtime_state)
+                if not ok:
+                    logging.error("交易后账户资金/持仓验证失败: %s", sync_message)
+                    notifier.notify("AI Stock 交易后校验失败", sync_message)
+                else:
+                    logging.info("交易后账户资金/持仓验证完成。")
+                    minimize_trading_app_if_idle(config, reason="post_trade_verified")
+            notifier.notify("AI Stock 订单已受理", f"{result.status}: {result.message}")
+            logging.info("%s 已记录订单生命周期: %s", symbol, signal)
             break
 
         portfolio.save()
+        append_order_event(
+            trading_log,
+            order=lifecycle_order,
+            status="REJECTED",
+            event_type="ORDER_REJECTED",
+            note=f"{result.status}: {result.message}",
+            event_time=result.submitted_at,
+            confidence="HIGH",
+        )
         notifier.notify("AI Stock 执行失败", f"{result.status}: {result.message}")
         logging.error("执行失败: %s", result)
 
@@ -1795,6 +2340,14 @@ def main() -> None:
     parser.add_argument("--clear-stop", action="store_true", help="清除 STOP_TRADING，允许交易引擎再次运行")
     parser.add_argument("--open-log", action="store_true", help="持续运行时额外打开实时日志窗口")
     parser.add_argument("--cleanup-screenshots", action="store_true", help="按配置立即清理 screenshots 历史截图和诊断 JSON")
+    parser.add_argument("--resolve-pending-order", metavar="ORDER_ID", help="人工核对后关闭指定待处理订单")
+    parser.add_argument(
+        "--resolution-status",
+        choices=["CANCELLED", "REJECTED"],
+        default="CANCELLED",
+        help="待处理订单的人工关闭状态（默认 CANCELLED）",
+    )
+    parser.add_argument("--resolution-note", default="", help="人工处理备注，将写入 TradingLog.csv")
     args = parser.parse_args()
 
     setup_logging()
@@ -1817,6 +2370,19 @@ def main() -> None:
 
     config = load_config()
     execution = config.get("execution", {})
+    if args.resolve_pending_order:
+        try:
+            order = resolve_pending_order(
+                args.resolve_pending_order,
+                args.resolution_status,
+                args.resolution_note,
+                RuntimeState(RUN_STATE_PATH),
+                TradingLog(TRADING_LOG_PATH),
+            )
+        except ValueError as exc:
+            raise SystemExit(str(exc)) from exc
+        print(f"已将待处理订单 {order['order_id']} 标记为 {order['status']}。")
+        return
     if args.cleanup_screenshots:
         result = cleanup_screenshots(config, force=True)
         print(

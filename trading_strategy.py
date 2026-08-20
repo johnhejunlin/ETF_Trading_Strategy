@@ -53,6 +53,7 @@ class TrendPullbackStrategy:
         # direction.  This check must precede sell logic so a same-day buy can
         # never be followed by a stop-loss/profit-taking sell.
         if self.portfolio.traded_today(symbol, today):
+            self.last_diagnostics["trading_block_reason"] = "今日已交易，仅监控（买入和卖出均禁止）"
             logging.info("%s 今日已交易，买入和卖出均跳过。", symbol)
             return None
         if quantity > 0:

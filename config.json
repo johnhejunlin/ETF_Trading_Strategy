@@ -17,7 +17,7 @@
   },
   "execution": {
     "mode": "ths_applescript",
-    "stage": "sim_run",
+    "stage": "gui_simulation",
     "ths_account_mode": "simulation",
     "live_account_enabled": false,
     "simulation_allow_repeated_symbol_trades": false,
@@ -39,7 +39,7 @@
       "full_live": 50000
     },
     "require_screenshot_verification": true,
-    "final_confirm_enabled": true,
+    "final_confirm_enabled": false,
     "price_tolerance": 0.001,
     "verification_fields_path": "screenshots/latest_verified_order.json",
     "order_verification_allowed_sources": ["applescript_vision_ocr"],
@@ -57,6 +57,7 @@
   },
   "runtime": {
     "trade_day_schedule_enabled": true,
+    "pending_order_alert_interval_minutes": 30,
     "stop_file": "STOP_TRADING",
     "state_file": "runtime_state.json",
     "screenshots_cleanup": {

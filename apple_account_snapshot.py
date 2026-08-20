@@ -463,6 +463,16 @@ def _component_has_single_hole(mask: list[list[bool]]) -> bool:
     return holes == 1
 
 
+def _zero_glyph_foreground_pixel(rgb: tuple[int, int, int]) -> bool:
+    """Recognize THS numeric text colors without treating pale cell chrome as ink."""
+    red, green, blue = rgb
+    red_text = red >= 85 and red - green >= 18 and red - blue >= 12
+    blue_text = blue >= 100 and blue - red >= 30 and blue - green >= 10
+    green_text = green >= 85 and green - red >= 18 and green - blue >= 12
+    neutral_dark_text = max(rgb) <= 180 and max(rgb) - min(rgb) <= 25
+    return red_text or blue_text or green_text or neutral_dark_text
+
+
 def detect_zero_in_holdings_cell(
     image_path: Path,
     items: list[OcrText],
@@ -470,11 +480,13 @@ def detect_zero_in_holdings_cell(
     header_label: str,
     row_symbol_y: float | None,
 ) -> dict[str, Any] | None:
-    """Recover an OCR-dropped red zero from one anchored holdings-table cell.
+    """Recover an OCR-dropped colored zero from one anchored holdings-table cell.
 
     The fallback is deliberately visual rather than semantic: a missing value is
     never assumed to be zero.  It requires the named table header, the target
-    security row, and a single red ring-shaped glyph inside that exact cell.
+    security row, and one ring-shaped numeric glyph inside that exact cell.
+    THS can render zero values in red, blue, green, or neutral gray depending on
+    row state and focus, so color is only used to separate text from pale chrome.
     """
     if row_symbol_y is None or not image_path.is_file():
         return None
@@ -521,11 +533,9 @@ def detect_zero_in_holdings_cell(
     if crop_width < 3 or crop_height < 3:
         return None
     pixels = crop.load()
-    red_mask = [
+    foreground_mask = [
         [
-            pixels[x, y][0] >= 85
-            and pixels[x, y][0] - pixels[x, y][1] >= 18
-            and pixels[x, y][0] - pixels[x, y][2] >= 12
+            _zero_glyph_foreground_pixel(pixels[x, y])
             for x in range(crop_width)
         ]
         for y in range(crop_height)
@@ -535,7 +545,7 @@ def detect_zero_in_holdings_cell(
     components: list[list[tuple[int, int]]] = []
     for y in range(crop_height):
         for x in range(crop_width):
-            if not red_mask[y][x] or (x, y) in seen:
+            if not foreground_mask[y][x] or (x, y) in seen:
                 continue
             component: list[tuple[int, int]] = []
             stack = [(x, y)]
@@ -547,7 +557,7 @@ def detect_zero_in_holdings_cell(
                     nx, ny = px + dx, py + dy
                     if not (0 <= nx < crop_width and 0 <= ny < crop_height):
                         continue
-                    if not red_mask[ny][nx] or (nx, ny) in seen:
+                    if not foreground_mask[ny][nx] or (nx, ny) in seen:
                         continue
                     seen.add((nx, ny))
                     stack.append((nx, ny))
@@ -557,32 +567,35 @@ def detect_zero_in_holdings_cell(
         return None
 
     # THS right-aligns numeric cells, so the glyph is not necessarily below the
-    # header centre.  Requiring exactly one glyph prevents a wider accidental
-    # crop from treating the trailing zero of a multi-digit quantity as zero.
-    if len(components) != 1:
+    # header centre.  First discard grid lines and fragments from adjacent cells,
+    # then require exactly one closed zero candidate in the target cell.
+    candidates: list[list[tuple[int, int]]] = []
+    for component in components:
+        min_x = min(point[0] for point in component)
+        max_x = max(point[0] for point in component)
+        min_y = min(point[1] for point in component)
+        max_y = max(point[1] for point in component)
+        glyph_width = max_x - min_x + 1
+        glyph_height = max_y - min_y + 1
+        aspect_ratio = glyph_width / glyph_height
+        fill_ratio = len(component) / (glyph_width * glyph_height)
+        if min_x == 0 or max_x == crop_width - 1 or min_y == 0 or max_y == crop_height - 1:
+            continue
+        if not (3 <= glyph_width <= crop_width * 0.7 and 5 <= glyph_height <= crop_height * 0.95):
+            continue
+        if not (0.30 <= aspect_ratio <= 1.35 and 0.10 <= fill_ratio <= 0.70):
+            continue
+        glyph_mask = [
+            [foreground_mask[y][x] for x in range(min_x, max_x + 1)]
+            for y in range(min_y, max_y + 1)
+        ]
+        if _component_has_single_hole(glyph_mask):
+            candidates.append(component)
+    if len(candidates) != 1:
         return None
-    component = components[0]
-    min_x = min(point[0] for point in component)
-    max_x = max(point[0] for point in component)
-    min_y = min(point[1] for point in component)
-    max_y = max(point[1] for point in component)
-    glyph_width = max_x - min_x + 1
-    glyph_height = max_y - min_y + 1
-    aspect_ratio = glyph_width / glyph_height
-    fill_ratio = len(component) / (glyph_width * glyph_height)
-    if not (3 <= glyph_width <= crop_width * 0.7 and 5 <= glyph_height <= crop_height * 0.95):
-        return None
-    if not (0.30 <= aspect_ratio <= 1.35 and 0.10 <= fill_ratio <= 0.70):
-        return None
-
-    glyph_mask = [
-        [red_mask[y][x] for x in range(min_x, max_x + 1)]
-        for y in range(min_y, max_y + 1)
-    ]
-    if not _component_has_single_hole(glyph_mask):
-        return None
+    component = candidates[0]
     return {
-        "method": "anchored_red_zero_glyph",
+        "method": "anchored_colored_zero_glyph",
         "header": header_label,
         "normalized_cell": [round(left, 6), round(bottom, 6), round(right, 6), round(top, 6)],
         "glyph_pixels": len(component),
