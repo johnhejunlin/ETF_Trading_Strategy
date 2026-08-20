@@ -115,8 +115,8 @@ python3 -m unittest discover -s tests
 3. `market_data.py` 获取目标股票实时行情和日 K 数据。
 4. `trading_strategy.py` 根据行情、均线、持仓和最新买入价生成买卖信号。
 5. `trading_engine.py` 的风控模块检查白名单、交易时段、交易日、仓位、金额和停止文件。
-6. 执行器根据 `execution.mode` 和 `execution.stage` 处理信号；当前默认 `sim_run` 会在同花顺模拟账户提交订单。
-7. 结果写入日志、`portfolio.json`、`signals.csv` 和 `runtime_state.json`。
+6. 执行器根据 `execution.mode` 和 `execution.stage` 处理信号；当前默认 `gui_simulation` 只填单和校验，不点击最终确认。
+7. 信号、订单生命周期和账户变化分别写入 `signals.csv`、`runtime_state.json` 和本地 `TradingLog.csv`。
 
 文件职责：
 
@@ -128,6 +128,7 @@ python3 -m unittest discover -s tests
 - `config.json`：配置中心。
 - `portfolio.json`：本地模拟资金和持仓状态，运行时自动创建，不上传 GitHub。
 - `signals.csv`：信号和执行审计，运行时自动追加，不上传 GitHub。
+- `TradingLog.csv`：订单状态、系统成交和外部/人工交易的追加式审计记录，不上传 GitHub。
 - `market_data.sqlite3`：行情数据库，保存回测日 K、回测 1 分钟 K 和实时轮询行情，不上传 GitHub。
 - `trading_engine.log`：交易引擎运行日志，不上传 GitHub。
 - `trading_engine.monitor.log`：后台托管运行时建议使用的监控日志，不上传 GitHub。
@@ -149,7 +150,7 @@ python3 -m unittest discover -s tests
 - 回测结果：`backtest_*.html`、`backtest_*.png`、`backtest_trades_*.csv`
 - 本地测试：`tests/`
 - 行情数据库：`market_data.sqlite3`
-- 本地运行状态：`portfolio.json`、`runtime_state.json`、`signals.csv`、`STOP_TRADING`
+- 本地运行状态：`portfolio.json`、`runtime_state.json`、`signals.csv`、`TradingLog.csv`、`STOP_TRADING`
 - 日志：`*.log`
 - GUI 自动化临时产物：`screenshots/*.png`、`screenshots/latest_order_intent.json`、`screenshots/latest_verified_order.json`
 - Python 缓存、虚拟环境和 IDE 配置：`__pycache__/`、`.venv/`、`venv/`、`.idea/`、`.vscode/`
@@ -211,6 +212,22 @@ launchctl remove com.aistock.tradingengine
 `execution.gui_bridge_command` 配置订单 AppleScript bridge；账户同步默认使用项目内置的 AppleScript + Apple Vision OCR bridge。交易引擎会写出 `screenshots/latest_order_intent.json`，然后等待并读取 `screenshots/latest_verified_order.json`；桥接实现必须写入账户模式、订单字段、提交状态、截图路径和可复盘日志。没有特殊要求时不使用 Computer Use 操作同花顺。
 
 `gui_simulation` 阶段只要求完成填单并写回 `submitted=false` 的校验文件。`sim_run` 阶段在字段校验通过且 `execution.final_confirm_enabled=true` 后，可由受控 GUI 自动化点击最终的“买入(模拟账户)”或“卖出(模拟账户)”按钮，并写回 `submitted=true`；后台引擎只认校验文件和截图凭证，不假设具体由哪种工具点击。`execution.applescript_bridge_timeout_seconds` 控制引擎等待回写结果的最长时间。
+
+当前安全配置为 `execution.stage=gui_simulation` 且 `execution.final_confirm_enabled=false`。恢复模拟账户自动最终提交前，必须先通过订单生命周期、部分成交、跨重启幂等和外部交易对账测试。
+
+### 订单生命周期与交易日志
+
+订单状态统一为 `VALIDATED`、`SUBMITTED`、`PARTIAL`、`FILLED`、`UNFILLED`、`CANCELLED` 和 `REJECTED`。只有已确认的非零成交量才会更新“今日已交易”、每日交易次数及连续卖出次数；`SUBMITTED` 和 `UNFILLED` 不再当作成交。
+
+待处理订单保存在 `runtime_state.json`。同一标的存在待处理订单时，系统继续监控行情，但禁止重复提交，并按 `runtime.pending_order_alert_interval_minutes` 限频预警。系统不会自动撤单或重试。
+
+人工在同花顺确认订单已经撤销或被拒绝后，可关闭本地待处理状态；该操作不会伪造成交，也不会更新交易次数：
+
+```bash
+python3 trading_engine.py --resolve-pending-order THS-合同号 --resolution-status CANCELLED --resolution-note "已在同花顺人工撤单并复核"
+```
+
+账户持仓变化优先匹配待处理系统订单。无法匹配的变化写入 `TradingLog.csv`，来源标记为 `EXTERNAL_OR_MANUAL`，只记录和预警，不中断系统。外部买入会重置连续卖出次数；外部卖出不计入策略连续卖出次数。委托价不会写成成交价；从账户成本或资金差额推算的价格会明确标记为估算值及置信度。
 
 当前 AppleScript GUI bridge 已接入模拟账户买入和卖出路径，默认 `execution.gui_bridge_command` 会根据订单 intent 自动选择方向，并以 Accessibility 为主路径：
 
@@ -351,6 +368,9 @@ sqlite3 market_data.sqlite3 ".tables"
 真实交易前请先长时间 dry-run、GUI 模拟和 sim-run。自动化交易可能因为行情延迟、网络、App 弹窗、坐标偏移等原因产生错误操作。当前代码只允许在同花顺模拟账户下提交订单，不会绕过截图/字段校验直接点击真实最终确认。
 
 ## 更新记录
+
+- 更新日期：2026-08-20
+- 更新内容：修复已提交订单被误记为成交及连续卖出次数无法递增的问题；新增待处理订单、账户差额对账与本地 `TradingLog.csv` 审计；系统外交易仅跟踪预警；自动最终确认暂时切回 GUI 模拟阶段。
 
 - 更新日期：2026-08-17
 - 更新内容：收紧交易频率为每日仅允许一次买入或卖出；回测买入上涨条件固定为最近两日连续上涨；增强同花顺账户快照解析，支持 OCR 漏识别红色 0 的可用余额兜底，并记录模拟成交均价用于本地持仓成本更新。

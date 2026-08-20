@@ -28,6 +28,7 @@ STOP_TRADING
 portfolio.json
 runtime_state.json
 signals.csv
+TradingLog.csv
 screenshots/*.png
 screenshots/*.json
 screenshots/apple_account_snapshot_*.json

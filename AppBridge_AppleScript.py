@@ -1240,6 +1240,25 @@ def load_verified_sellable_quantity(snapshot_path: Path, symbol: str) -> int | N
     return verified_sellable_quantity_from_snapshot(snapshot, symbol)
 
 
+def final_order_quantity(
+    side: str,
+    requested_quantity: int,
+    sellable_quantity: int | None,
+) -> int:
+    """Resolve the quantity sent to THS without changing the strategy intent."""
+    if side != "SELL":
+        return requested_quantity
+    if sellable_quantity is None:
+        raise RuntimeError("cannot verify sellable quantity from synchronized account data")
+    quantity = min(requested_quantity, sellable_quantity)
+    if quantity <= 0:
+        raise RuntimeError(
+            f"no sellable quantity available: requested={requested_quantity} "
+            f"sellable={sellable_quantity}"
+        )
+    return quantity
+
+
 def confirmation_dialog_items(items: list[OcrText]) -> list[OcrText]:
     """Restrict confirmation-field OCR to the centered native modal."""
     dialog_items = []
@@ -1488,7 +1507,7 @@ def run_order(
     allow_visual_fallback: bool = True,
 ) -> dict[str, Any]:
     order = read_order_intent(intent_path)
-    symbol, side, quantity, limit_price = expected_order_fields(order)
+    symbol, side, requested_quantity, limit_price = expected_order_fields(order)
     label = side.lower()
     action = "买入" if side == "BUY" else "卖出"
     account_sellable_quantity = (
@@ -1496,6 +1515,8 @@ def run_order(
         if side == "SELL"
         else None
     )
+    quantity = final_order_quantity(side, requested_quantity, account_sellable_quantity)
+    quantity_adjusted = quantity != requested_quantity
 
     # A validation-only invocation deliberately leaves the confirmation dialog
     # open. On the submit invocation, resume that exact OCR-verified dialog
@@ -1557,14 +1578,6 @@ def run_order(
                 raise RuntimeError(f"Accessibility field readback failed: {mismatched_ax_fields}")
         if not is_simulated_order_form(items, side):
             raise RuntimeError(f"lost simulated {label} form after filling fields")
-        if side == "SELL":
-            if verified_sellable_quantity is None:
-                raise RuntimeError("cannot verify sellable quantity from synchronized account data")
-            if quantity > verified_sellable_quantity:
-                raise RuntimeError(
-                    f"sell quantity {quantity} exceeds verified sellable quantity {verified_sellable_quantity}"
-                )
-
         button_targets = [f"确定{action}", f"{action}（模拟账户）", f"{action}(模拟账户)"]
         if interaction_mode == "accessibility_first":
             try:
@@ -1607,15 +1620,6 @@ def run_order(
     if not is_simulation_context(text):
         ok = False
         validation_errors.append("missing simulation account context")
-    if side == "SELL":
-        if verified_sellable_quantity is None:
-            ok = False
-            validation_errors.append("missing synchronized account sellable quantity")
-        elif quantity > verified_sellable_quantity:
-            ok = False
-            validation_errors.append(
-                f"sell quantity {quantity} exceeds verified sellable quantity {verified_sellable_quantity}"
-            )
     if not ok:
         result = {
             "created_at": datetime.now().isoformat(timespec="seconds"),
@@ -1624,6 +1628,8 @@ def run_order(
             "symbol": symbol,
             "side": side,
             "quantity": quantity,
+            "requested_quantity": requested_quantity,
+            "quantity_adjusted": quantity_adjusted,
             "limit_price": limit_price,
             "sellable_quantity": verified_sellable_quantity,
             "submitted": False,
@@ -1764,6 +1770,8 @@ def run_order(
         "symbol": symbol,
         "side": side,
         "quantity": quantity,
+        "requested_quantity": requested_quantity,
+        "quantity_adjusted": quantity_adjusted,
         "limit_price": limit_price,
         "fill_price": fill_price,
         "sellable_quantity": verified_sellable_quantity,
