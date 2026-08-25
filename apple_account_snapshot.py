@@ -245,7 +245,7 @@ def get_coregraphics_window_id(owner_hint: str, title_hint: str | None) -> int |
         height = float(window.get("height", 0))
         if width < 400 or height < 300:
             continue
-        if owner_hint not in owner and (not title_hint or title_hint not in title):
+        if owner != owner_hint:
             continue
         score = width * height
         if window.get("is_onscreen"):
