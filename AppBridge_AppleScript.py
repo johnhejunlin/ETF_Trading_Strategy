@@ -914,9 +914,13 @@ def capture_ocr(
         process_name=process_name,
         timeout_seconds=APP_READY_TIMEOUT_SECONDS,
     )
-    timings["app_ready_ms"] = round((time.monotonic() - ready_started) * 1000, 1)
     rect = tuple(ready_state["window_rect"])
-    window_id = get_coregraphics_window_id("同花顺", app_name)
+    window_id = get_coregraphics_window_id(
+        process_name,
+        app_name,
+        timeout_seconds=max(0.0, APP_READY_TIMEOUT_SECONDS - (time.monotonic() - ready_started)),
+    )
+    timings["app_ready_ms"] = round((time.monotonic() - ready_started) * 1000, 1)
     if window_id is None:
         raise AppWindowGuardError(f"cannot identify {process_name} CoreGraphics window")
     verify_app_window_state(process_name, expected_rect=rect)
